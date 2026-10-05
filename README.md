@@ -1,4 +1,7 @@
-# Genesis Leaf
+# <img width="64" height="64" alt="image" src="https://github.com/user-attachments/assets/82a21200-f863-4787-9797-a0f82039bcc5" /> <img width="365" height="64" alt="image" src="https://github.com/user-attachments/assets/204d719d-74b5-4c2a-9662-d47bdddd22dc" />
+
+
+
 ### Legend of Legaia · Language Pack Suite — Public Beta
 
 Genesis Leaf is a desktop editor for translating **Legend of Legaia**. You open a
@@ -10,6 +13,8 @@ game's own font. The whole program is styled after the game's menus.
 
 You need **your own copy of the game**. Genesis Leaf contains no game script and
 never modifies your disc.
+
+<img width="1402" height="892" alt="image" src="https://github.com/user-attachments/assets/23f429b4-8a7e-4e99-b5b0-e8e4994cb5be" />
 
 ---
 
@@ -27,6 +32,10 @@ never modifies your disc.
   (and a PPF patch) without leaving the program.
 - **Two looks.** The game-menu look is on by default; *Options → Legaia menu UI*
   switches to a plain classic window style (Default or Midnight palette).
+
+
+<img width="1402" height="892" alt="image" src="https://github.com/user-attachments/assets/08e05036-c470-4de3-8f18-ad0162e509e4" />
+
 
 ## What you need
 
@@ -84,5 +93,6 @@ Legend of Legaia is a trademark of its publisher; this is an unofficial fan
 project and no affiliation is implied.
 
 ---
-
 **© 2026 Stann0x Studio. All rights reserved.**
+
+<img width="368" height="122" alt="MEINLOGO" src="https://github.com/user-attachments/assets/fc5b8fc5-4938-48b3-ad77-403e132707e8" />
