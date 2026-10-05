@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Working packs carry the game script - share only stripped packs
+extraction_samples/
+*.bak
+*.tmp
+
+# Local settings / sidecars written by the program
+GenesisLeaf.json
+*.dict.json
+*.notes.json
+output/
+
+# Parsed-pack cache (pickles of opened packs, rebuilt on demand)
+.cache/
