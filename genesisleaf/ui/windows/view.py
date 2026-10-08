@@ -4,6 +4,7 @@ Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 """
 
 import tkinter as tk
+from time import perf_counter
 from tkinter import ttk
 
 from genesisleaf.core.bookkeeping import edited_on
@@ -64,6 +65,8 @@ class ViewWindow:
         self._loading = False
         self._editing = False          # set while this view made a change
         self._find_hits = None
+        self._view_gen = 0
+        self._insert_job = None
         self._line_ed_map = {}
         self._line_hdr_map = {}
 
@@ -447,8 +450,6 @@ class ViewWindow:
         if self.filter_section != "All" and sec != self.filter_section:
             return False
         tr = e.get("translation", "")
-        b, _ = parse_text(tr)
-        non = any(st == "nonascii" for _, _, st in parse_text(tr)[1])
         st = self.filter_status
         if st == "Untranslated" and tr:
             return False
@@ -456,6 +457,7 @@ class ViewWindow:
             return False
         if st in ("Won't fit", "Grows (free space)"):
             want = "over" if st == "Won't fit" else "grows"
+            b, _ = parse_text(tr)
             if not tr or space_verdict(sec, e, b) != want:
                 return False
         if st == "Overdraw (source)" and \
@@ -464,7 +466,8 @@ class ViewWindow:
         if st == "Overdraw (translation)" and \
                 not (tr and self.app.row_overdraw(i, tr)[1]):
             return False
-        if st == "Has non-ASCII" and not non:
+        if st == "Has non-ASCII" and not any(
+                kind == "nonascii" for _, _, kind in parse_text(tr)[1]):
             return False
         if self.filter_text and self.filter_text.lower() not in \
                 self._scope_haystack(e).lower():
@@ -504,12 +507,21 @@ class ViewWindow:
         self.rebuild_view()
 
     def rebuild_view(self):
+        self._view_gen += 1
+        gen = self._view_gen
+        if self._insert_job is not None:
+            try:
+                self.win.after_cancel(self._insert_job)
+            except tk.TclError:
+                pass
+            self._insert_job = None
         self.filter_section = self.sec_cb.get() or "All"
         self.filter_status = self.st_cb.get() or "All"
         self._find_hits = None
         idxs = [i for i in range(len(self.pack.flat)) if self._passes(i)]
         if self._sort_col:
             idxs = sorted(idxs, key=self._sort_key, reverse=self._sort_rev)
+        old_count = len(self._pos_iids)
         self.view = idxs
         self.view_iid = {}
         self._iid_by_flat = {}
@@ -518,12 +530,35 @@ class ViewWindow:
         self._band_state = {"unit": None, "n": 0}
         self._band_map = self.app.box_map()
         self.cellsel.clear()
+        if max(old_count, len(self.view)) > 2000 and not getattr(
+                self, "_bulk_hidden", False):
+            self.tree.grid_remove()
+            self._bulk_hidden = True
         self.tree.delete(*self.tree.get_children())
-        for i in idxs:
-            self._insert_row(i)
         self.nav_lab.configure(text="%d shown" % len(self.view))
-        if self.current >= 0:
-            self.refresh_row(self.current)
+        self._insert_rows(0, gen)
+
+    def _insert_rows(self, start, gen):
+        """Yield to Tk between short insertion batches in large views."""
+        if gen != self._view_gen or not self.win.winfo_exists():
+            return
+        self._insert_job = None
+        deadline = perf_counter() + 0.008
+        end = min(start + 256, len(self.view))
+        i = start
+        while i < end:
+            self._insert_row(self.view[i])
+            i += 1
+            if perf_counter() >= deadline:
+                break
+        if i < len(self.view):
+            self._insert_job = self.win.after(1, self._insert_rows, i, gen)
+        else:
+            if getattr(self, "_bulk_hidden", False):
+                self._bulk_hidden = False
+                self.tree.grid()
+            if self.current >= 0:
+                self.refresh_row(self.current)
 
     def _band_for(self, i):
         row = self._band_map.get(i)
@@ -565,12 +600,12 @@ class ViewWindow:
     def _insert_row(self, i):
         _sec, e = self.pack.flat[i]
         mark, tag, b, budget, tr, over = self._state(i)
+        band = self._band_for(i)
         iid = self.tree.insert("", "end", values=(
             i + 1, mark, "✎" if e.get("notes") else "", _sec,
             e.get("key", ""), e.get("context", ""),
-            e.get("source", ""), tr, "%d/%d" % (b, budget)))
-        band = self._band_for(i)
-        self.tree.item(iid, tags=self._row_tags(tag, over, band))
+            e.get("source", ""), tr, "%d/%d" % (b, budget)),
+            tags=self._row_tags(tag, over, band))
         self._band_of[iid] = band
         self.view_iid[iid] = i
         self._iid_by_flat[i] = iid
@@ -733,6 +768,7 @@ class ViewWindow:
         try:
             w.delete("1.0", "end")
             w.insert("1.0", text)
+            w._tag_content = None
             w.edit_modified(False)
             w.edit_reset()
         finally:
@@ -761,9 +797,7 @@ class ViewWindow:
         try:
             self.app._tr_modified_common(w)
             self.app._bytes_label()
-            self.app.invalidate_stats()
-            self.app.update_preview()
-            self.app.update_status()
+            self.app.schedule_preview()
             self._update_status()
         finally:
             self._editing = False
@@ -940,6 +974,13 @@ class ViewWindow:
             self._load_editor()
 
     def close(self):
+        self._view_gen += 1
+        if self._insert_job is not None:
+            try:
+                self.win.after_cancel(self._insert_job)
+            except tk.TclError:
+                pass
+            self._insert_job = None
         app = self.app
         try:
             app._views.remove(self)

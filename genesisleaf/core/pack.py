@@ -4,10 +4,15 @@ Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 """
 
 import hashlib
+from contextlib import closing
 import json
 import os
-import pickle
 import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 import yaml
 
 from genesisleaf.core.bookkeeping import entry_uuid
@@ -15,17 +20,18 @@ from genesisleaf.core.dialog import dialog_boxes
 from genesisleaf.core.encoding import parse_text
 from genesisleaf.core.space import verdict as space_verdict
 from genesisleaf.paths import APP_ROOT
+from genesisleaf.diagnostics import current as current_diagnostics
+from genesisleaf.core.working_store import WorkingStore
 
 
 # ---------------------------------------------------------------------------
-# Parse cache.  PyYAML builds the 30k-entry tree in Python (~2 s even with
-# libyaml); a pickle of the same tree loads in a few ms.  An entry is keyed
-# by the file's path, size and modification time, so any change on disk -
-# including our own saves - misses and re-parses.  The cache holds data the
-# program wrote itself and is only a speed-up: any failure falls back to
-# parsing the YAML.
+# SQLite parse cache. YAML remains the interchange and save format. Both the
+# editor and comparator call Pack.load, so each loaded file gets its own
+# indexed database keyed by path, size and modification time. A cache miss
+# parses YAML in a child process for large packs and atomically publishes a DB.
 # ---------------------------------------------------------------------------
 PARSE_CACHE_KEEP = 8      # newest cached packs kept
+PARSE_CACHE_VERSION = 1
 
 
 def _parse_cache_dir():
@@ -36,47 +42,112 @@ def _parse_cache_dir():
 
 
 def _parse_cache_file(path, st):
-    tag = "%s|%d|%d" % (os.path.abspath(path).lower(), st.st_size,
-                        st.st_mtime_ns)
+    tag = "%d|%s|%d|%d" % (PARSE_CACHE_VERSION,
+                           os.path.abspath(path).lower(), st.st_size,
+                           st.st_mtime_ns)
     return os.path.join(_parse_cache_dir(),
                         hashlib.sha1(tag.encode("utf-8")).hexdigest()
-                        + ".pickle")
+                        + ".sqlite3")
 
 
 def _parse_cache_get(path):
     try:
         cf = _parse_cache_file(path, os.stat(path))
-        with open(cf, "rb") as fh:
-            data = pickle.load(fh)
+        with closing(sqlite3.connect(Path(cf).as_uri() + "?mode=ro",
+                                     uri=True)) as db:
+            header = json.loads(db.execute(
+                "SELECT value FROM metadata WHERE key = 'header'").fetchone()[0])
+            names = json.loads(db.execute(
+                "SELECT value FROM metadata WHERE key = 'sections'").fetchone()[0])
+            sections = {name: [] for name in names}
+            for sec, payload in db.execute(
+                    "SELECT section, payload FROM entries ORDER BY seq"):
+                sections[sec].append(json.loads(payload))
+        data = dict(header, sections=sections)
         os.utime(cf)              # recently used: survives pruning
-        return data if isinstance(data, dict) else None
+        return data
     except Exception:             # noqa: BLE001 - a miss, never an error
         return None
 
 
 def _parse_cache_put(path, data):
+    tmp = None
     try:
         cf = _parse_cache_file(path, os.stat(path))
         d = os.path.dirname(cf)
         os.makedirs(d, exist_ok=True)
-        tmp = cf + ".tmp"
-        with open(tmp, "wb") as fh:
-            pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        fd, tmp = tempfile.mkstemp(suffix=".sqlite3", dir=d)
+        os.close(fd)
+        with closing(sqlite3.connect(tmp)) as db:
+            db.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("CREATE TABLE entries (seq INTEGER PRIMARY KEY, section TEXT NOT NULL, payload TEXT NOT NULL)")
+            db.executemany("INSERT INTO metadata VALUES (?, ?)", (
+                ("header", json.dumps({k: v for k, v in data.items() if k != "sections"},
+                                       ensure_ascii=False)),
+                ("sections", json.dumps(list(data["sections"]), ensure_ascii=False)),
+            ))
+            db.executemany("INSERT INTO entries (section, payload) VALUES (?, ?)",
+                           ((sec, json.dumps(entry, ensure_ascii=False))
+                            for sec, entries in data["sections"].items()
+                            for entry in (entries or [])))
+            db.execute("CREATE INDEX entries_section ON entries(section)")
+            db.commit()
         os.replace(tmp, cf)
         old = sorted((os.path.join(d, n) for n in os.listdir(d)
-                      if n.endswith(".pickle")),
+                      if n.endswith(".sqlite3")),
                      key=os.path.getmtime, reverse=True)
         for f in old[PARSE_CACHE_KEEP:]:
             os.remove(f)
     except Exception:             # noqa: BLE001 - caching is optional
         pass
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _parse_yaml_and_cache(path):
+    with open(path, "r", encoding="utf-8") as source:
+        contents = source.read()
+    try:
+        data = yaml.load(contents, Loader=yaml.CSafeLoader)
+    except Exception:
+        data = yaml.safe_load(contents)
+    if isinstance(data, dict) and isinstance(data.get("sections"), dict):
+        _parse_cache_put(path, data)
+    return data
+
+
+def _parse_in_worker_process(path):
+    """Parse a large cache miss outside Tk's Python process.
+
+    PyYAML's C loader can hold the GIL long enough to freeze Tk even when it
+    runs in a thread. The child publishes the SQLite cache, so only a short
+    cache read and model build happen back in this process.
+    """
+    if getattr(sys, "frozen", False):
+        return None
+    monitor = current_diagnostics()
+    if monitor is not None:
+        monitor.event("YAML_PARSE_PROCESS", file=os.path.basename(path),
+                      bytes=os.path.getsize(path))
+    try:
+        run = subprocess.run(
+            [sys.executable, "-m", "genesisleaf.core.parse_cache_worker", path],
+            cwd=APP_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False)
+        if monitor is not None:
+            monitor.event("YAML_PARSE_PROCESS_DONE", exit_code=run.returncode)
+        return _parse_cache_get(path) if run.returncode == 0 else None
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Pack loading / saving (perfect round-trip, same format as the exporter).
 # ---------------------------------------------------------------------------
-
-HEADER_KEYS = ("format", "language", "game", "notes", "contributors")
 
 # pack languages whose text needs the accent font (accented Latin letters)
 ACCENT_LANGS = frozenset((
@@ -112,6 +183,7 @@ class Pack:
         self.same_source = {}   # lower(source) -> [flat indices]
         self.word_index = {}    # word -> [flat indices]
         self._word_cache = {}
+        self.working_store = None
 
     # -- loading ---------------------------------------------------------
     def load(self, path):
@@ -123,15 +195,12 @@ class Pack:
         Pack nobody else is reading yet (see ui.app.pack_io)."""
         data = _parse_cache_get(path)
         if data is None:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-            try:
-                data = yaml.load(text, Loader=yaml.CSafeLoader)
-            except Exception:
-                data = yaml.safe_load(text)
-            if isinstance(data, dict) and isinstance(data.get("sections"),
-                                                     dict):
-                _parse_cache_put(path, data)
+            # Large files use another process on first open. Threads do not
+            # protect the event loop when libyaml keeps the GIL during parse.
+            if os.stat(path).st_size >= 1_000_000:
+                data = _parse_in_worker_process(path)
+            if data is None:
+                data = _parse_yaml_and_cache(path)
 
         if not isinstance(data, dict) or "sections" not in data:
             raise ValueError(
@@ -162,12 +231,22 @@ class Pack:
                 e.setdefault("joined", "")
             sections[sec] = entries
 
+        header = {k: v for k, v in data.items() if k != "sections"}
+        working_store = WorkingStore(path, header, sections)
+        if self.working_store is not None:
+            self.working_store.close()
+        self.working_store = working_store
         self.path = path
-        self.header = {k: v for k, v in data.items() if k != "sections"}
+        self.header = header
         self.sections = sections
         self.section_names = list(sections)
         self._word_cache = {}
         self.rebuild_indexes()
+
+    def close(self):
+        if self.working_store is not None:
+            self.working_store.close()
+            self.working_store = None
 
     def rebuild_indexes(self):
         # flat indices are about to be renumbered, so anything cached against
@@ -179,11 +258,14 @@ class Pack:
                 self.flat.append((sec, e))
         same = {}
         words = {}
+        source_words = {}
         for idx, (_, e) in enumerate(self.flat):
             src = e.get("source", "")
             lsrc = src.lower()
             same.setdefault(lsrc, []).append(idx)
-            for w in self._source_words(src):
+            if src not in source_words:
+                source_words[src] = self._source_words(src)
+            for w in source_words[src]:
                 words.setdefault(w, []).append(idx)
         self.same_source = same
         self.word_index = words
@@ -235,9 +317,11 @@ class Pack:
         by_sec = {}
         filled = over_budget = non_ascii = over_any = grows = 0
         for sec, e in self.flat:
-            d = by_sec.setdefault(sec, {"total": 0, "filled": 0,
-                                        "over_budget": 0, "non_ascii": 0,
-                                        "over_any": 0, "grows": 0})
+            d = by_sec.get(sec)
+            if d is None:
+                d = by_sec[sec] = {"total": 0, "filled": 0,
+                                  "over_budget": 0, "non_ascii": 0,
+                                  "over_any": 0, "grows": 0}
             d["total"] += 1
             tr = e.get("translation", "")
             if tr:

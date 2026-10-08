@@ -5,7 +5,7 @@ Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 
 import tkinter as tk
 
-from genesisleaf.core.colors import norm_color, readable_on, rel_lum
+from genesisleaf.core.colors import mix, norm_color, readable_on, rel_lum
 from genesisleaf.core.config import load_config, save_config
 from genesisleaf.core.constants import SEARCH_SCOPES
 from genesisleaf.core import palette as _palette
@@ -33,8 +33,7 @@ class AppearanceMixin:
 
     # -- styling ----------------------------------------------------------
     def set_theme(self, name):
-        """Choose the classic palette (Options > Classic palette).  It shows
-        at once unless the game-menu UI is on, which keeps its own palette."""
+        """Choose widget colours and tint the graphical Legaia menu chrome."""
         return self._switch_look(lambda: set_theme(name))
 
     def set_menu_ui(self, on):
@@ -59,8 +58,7 @@ class AppearanceMixin:
         colours that widgets were created with are carried over to the new
         palette, and `apply_theme` re-pushes the palette into the ttk styles
         and the plain Tk widgets that already exist.  Finally the text tags
-        and the tree tags are reconfigured and the table is rebuilt, because a
-        row's colours are baked into its tag tuple at insert time."""
+        and existing row tags are reconfigured in place."""
         old = _theme.current_values()
         result = change()
         _skin.use(self.style, _theme.MENU_UI)
@@ -81,14 +79,13 @@ class AppearanceMixin:
             self._notes_paint()
         if hasattr(self, "_rebuild_menubar"):
             self._rebuild_menubar()
-        self.rebuild_view()
-        if self.current >= 0:
-            # the rebuild dropped the highlight - put it back
-            self._select_lock = True
-            try:
-                self._select_box(self.current)
-            finally:
-                self._select_lock = False
+        # Tag colours are live ttk state: theme switching does not require
+        # destroying/reinserting every table row or discarding picked cells.
+        self.cellsel.schedule()
+        for name in ("cmp_cellsel", "cmp_cellsel_r"):
+            picker = getattr(self, name, None)
+            if picker is not None:
+                picker.schedule()
         for v in list(self._views):
             v.apply_theme()
         for tree in self._all_trees():
@@ -270,6 +267,11 @@ class AppearanceMixin:
                 s.configure(style, **kw)
             except tk.TclError:
                 pass
+        skinned = _theme.MENU_UI
+        btn_bg = _theme.TH_FRAME_BG if skinned else _theme.TH_BTN_BG
+        tool_bg = _theme.TH_CHROME_BG if skinned else _theme.TH_BTN_BG
+        btn_hot = _theme.TH_FRAME_BG if skinned else _theme.TH_BTN_HOVER
+        tool_hot = _theme.TH_CHROME_BG if skinned else _theme.TH_BTN_HOVER
         cfg(".", background=_theme.TH_FRAME_BG, foreground=_theme.TH_FG,
             fieldbackground=_theme.TH_FIELD_BG, bordercolor=_theme.TH_BORDER,
             lightcolor=_theme.TH_FRAME_BG, darkcolor=_theme.TH_BORDER)
@@ -280,7 +282,7 @@ class AppearanceMixin:
             relief="solid", thickness=1)
         cfg("TLabelFrame.Label", background=_theme.TH_FRAME_BG,
             foreground=_theme.TH_FG_MUTED)
-        cfg("TButton", background=_theme.TH_CHROME_BG, foreground=_theme.TH_FG,
+        cfg("TButton", background=btn_bg, foreground=_theme.TH_BTN_FG,
             bordercolor=_theme.TH_BORDER, focuscolor=_theme.TH_ACCENT, padding=(8, 3))
         cfg("TEntry", fieldbackground=_theme.TH_FIELD_BG, foreground=_theme.TH_FG,
             bordercolor=_theme.TH_BORDER, insertcolor=_theme.TH_FG, padding=2,
@@ -298,11 +300,16 @@ class AppearanceMixin:
         cfg("TNotebook.Tab", background=_theme.TH_CHROME_BG, foreground=_theme.TH_FG,
             padding=(10, 4))
         cfg("TSeparator", background=_theme.TH_BORDER)
-        cfg("TMenubutton", background=_theme.TH_CHROME_BG, foreground=_theme.TH_FG)
+        cfg("TMenubutton", background=btn_bg, foreground=_theme.TH_BTN_FG)
+        cfg("Menubar.TButton", background=_theme.TH_CHROME_BG if skinned
+            else _theme.TH_HEAD_BG,
+            foreground=_theme.TH_HEAD_FG)
         cfg("Treeview", background=_theme.TH_TREE_BG, fieldbackground=_theme.TH_TREE_BG,
             foreground=_theme.TH_FG, bordercolor=_theme.TH_BORDER, borderwidth=1,
             rowheight=20, relief="solid")
-        cfg("Treeview.Heading", background=_theme.TH_HEAD_BG, foreground=_theme.TH_HEAD_FG,
+        cfg("Treeview.Heading",
+            background=_theme.TH_TREE_BG if skinned else _theme.TH_HEAD_BG,
+            foreground=_theme.TH_HEAD_FG,
             bordercolor=_theme.TH_BORDER, relief="flat", padding=(4, 4))
         try:
             s.map("Treeview",
@@ -312,8 +319,15 @@ class AppearanceMixin:
             pass
         for name in ("TScrollbar", "Vertical.TScrollbar",
                      "Horizontal.TScrollbar"):
-            cfg(name, background=_theme.TH_CHROME_BG, troughcolor=_theme.TH_FRAME_BG,
-                bordercolor=_theme.TH_BORDER, arrowcolor=_theme.TH_FG)
+            cfg(name, background=_theme.TH_SCROLL, troughcolor=_theme.TH_FRAME_BG,
+                bordercolor=_theme.TH_BORDER, lightcolor=_theme.TH_SCROLL,
+                darkcolor=_theme.TH_SCROLL,
+                arrowcolor=readable_on(_theme.TH_FG, _theme.TH_SCROLL, 3.0))
+            try:
+                s.map(name, background=[
+                    ("active", mix(_theme.TH_SCROLL, "#ffffff", 0.25))])
+            except tk.TclError:
+                pass
 
         # Contrast for the states ttk does not carry by default: focus rings
         # on fields, disabled foregrounds, and the checkbox indicator.
@@ -340,8 +354,7 @@ class AppearanceMixin:
                   foreground=[("disabled", _theme.TH_FG_FAINT)])
             s.map("TButton",
                   foreground=[("disabled", _theme.TH_FG_FAINT)],
-                  background=[("pressed", _theme.TH_CHROME_BG),
-                              ("active", _theme.TH_CHROME_BG)])
+                  background=[("pressed", btn_hot), ("active", btn_hot)])
             s.map("Treeview",
                   background=[("selected", _theme.TH_SEL_BG)],
                   foreground=[("selected", _theme.TH_SEL_FG),
@@ -355,8 +368,8 @@ class AppearanceMixin:
             foreground=_theme.TH_FG)
         cfg("Chrome.TCheckbutton", background=_theme.TH_CHROME_BG,
             foreground=_theme.TH_FG)
-        cfg("Tool.TButton", background=_theme.TH_CHROME_BG,
-            foreground=_theme.TH_FG, bordercolor=_theme.TH_CHROME_BG,
+        cfg("Tool.TButton", background=tool_bg,
+            foreground=_theme.TH_BTN_FG, bordercolor=_theme.TH_BORDER,
             padding=(6, 1), font=FONT_UI_SM)
         cfg("Chrome.TCheckbutton", font=FONT_UI_SM)
         cfg("Small.TCheckbutton", font=FONT_UI_SM)
@@ -373,8 +386,7 @@ class AppearanceMixin:
             lightcolor=_theme.TH_ACCENT, darkcolor=_theme.TH_ACCENT)
         try:
             s.map("Tool.TButton",
-                  background=[("pressed", _theme.TH_SEL_BG),
-                              ("active", _theme.TH_FRAME_BG)],
+                  background=[("pressed", tool_hot), ("active", tool_hot)],
                   bordercolor=[("active", _theme.TH_BORDER)])
             s.map("Chrome.TCheckbutton",
                   background=[("active", _theme.TH_CHROME_BG)])

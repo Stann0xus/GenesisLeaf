@@ -9,6 +9,7 @@ import queue as _q
 import re
 import subprocess
 import threading
+from time import perf_counter
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -289,18 +290,15 @@ class RomBuilderMixin:
             cmds.append(("[import] translate import", imp))
             return exe, cmds
 
-        def worker():
+        def worker(exe, cmds, disc, output_dir):
             try:
-                exe, cmds = commands()
-                disc = v["disc"].get().strip()
                 if not os.path.isfile(exe):
                     q.put((2, "patcher exe not found:\n%s" % exe))
                 elif not os.path.isfile(disc):
                     q.put((2, "retail disc not found:\n%s\n\nUse the PRISTINE "
                               "disc - never an already-patched image." % disc))
                 else:
-                    os.makedirs(os.path.dirname(v["out"].get()) or ".",
-                                exist_ok=True)
+                    os.makedirs(output_dir, exist_ok=True)
                     for label, args in cmds:
                         q.put((0, "== %s ==" % label))
                         q.put((0, "> %s %s" % (os.path.basename(exe),
@@ -323,22 +321,32 @@ class RomBuilderMixin:
                 q.put((99, None))
 
         def pump():
+            if not win.winfo_exists():
+                return
+            deadline = perf_counter() + 0.008
+            segments = []
+            finished = False
             try:
-                while True:
+                while len(segments) < 256 and perf_counter() < deadline:
                     kind, payload = q.get_nowait()
                     if kind == 99:
-                        run_btn.configure(state="normal")
-                        self._summary_from_log(log)
-                        return
-                    if kind == 0:
-                        log.insert("end", payload + "\n", "head")
-                    elif kind == 2:
-                        log.insert("end", payload + "\n", "err")
+                        finished = True
+                        break
+                    tag = "head" if kind == 0 else "err" if kind == 2 else ""
+                    if segments and segments[-1][1] == tag:
+                        segments[-1][0].append(payload + "\n")
                     else:
-                        log.insert("end", payload + "\n")
-                    log.see("end")
+                        segments.append(([payload + "\n"], tag))
             except _q.Empty:
                 pass
+            for lines, tag in segments:
+                log.insert("end", "".join(lines), tag)
+            if segments:
+                log.see("end")
+            if finished:
+                run_btn.configure(state="normal")
+                self._summary_from_log(log)
+                return
             win.after(80, pump)
 
         def start():
@@ -366,7 +374,10 @@ class RomBuilderMixin:
             self._sync_relayout_var()
             log.delete("1.0", "end")
             run_btn.configure(state="disabled")
-            threading.Thread(target=worker, daemon=True).start()
+            # Snapshot Tk variables on the UI thread before starting disk work.
+            exe, cmds = commands()
+            threading.Thread(target=worker, args=(exe, cmds, v["disc"].get().strip(),
+                              os.path.dirname(v["out"].get()) or "."), daemon=True).start()
             pump()
 
         run_btn.configure(command=start)

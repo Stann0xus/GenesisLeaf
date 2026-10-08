@@ -19,6 +19,7 @@ class FindFilterMixin:
 
     # -- filtering / tree --------------------------------------------------------
     def clear_search(self):
+        self._cancel_search()
         self.search_ent.delete(0, "end")
         self._find_hits = None
         self.find_lab.configure(text="")
@@ -27,6 +28,7 @@ class FindFilterMixin:
     def _on_scope_change(self, _evt=None):
         """A new scope changes what counts as a hit, so the cached list, the
         table filter and the tally all have to be redone."""
+        self._cancel_search()
         self.find_scope = self.scope_cb.get() or "All"
         self._find_hits = None
         self.rebuild_view()
@@ -38,6 +40,7 @@ class FindFilterMixin:
     def _on_filter_toggle(self):
         """Filter on = the Find text narrows the table.  Off = the table is left
         exactly as it is and the Find text only steers the selection."""
+        self._cancel_search()
         self._find_hits = None
         if self.find_filter_var.get():
             self.rebuild_view()
@@ -45,18 +48,24 @@ class FindFilterMixin:
             self._find_step(1)
 
     def _schedule_search(self):
+        self._cancel_search()
+        self._search_job = self.root.after(2000, self._run_scheduled_search)
+
+    def _cancel_search(self):
         if self._search_job:
             self.root.after_cancel(self._search_job)
-        if self.find_filter_var.get():
-            self._search_job = self.root.after(180, self.rebuild_view)
-        else:
-            self._search_job = self.root.after(220, self._find_step, 1)
+            self._search_job = None
 
-    def _find_enter(self):
+    def _run_scheduled_search(self):
+        self._search_job = None
         if self.find_filter_var.get():
             self.rebuild_view()
         else:
             self._find_step(1)
+
+    def _find_enter(self):
+        self._cancel_search()
+        self._run_scheduled_search()
 
     def _scope_haystack(self, e, scope=None):
         """The text a search should look inside, per the chosen scope.
@@ -165,11 +174,10 @@ class FindFilterMixin:
                 self._select_lock = False
         self.select_entry(i)
 
-    def _filters(self, idx, ignore_metadata=False):
-        sec, e = self.pack.flat[idx]
+    def _metadata_matches(self, sec, e):
         field = getattr(self, "filter_field", "Section")
         value = getattr(self, "filter_value", "All")
-        if value != "All" and not ignore_metadata:
+        if value != "All":
             if field == "Section" and sec != value:
                 return False
             if field == "Context" and e.get("context", "") not in self._ctx_match:
@@ -182,9 +190,13 @@ class FindFilterMixin:
                         return False
                 except (TypeError, ValueError):
                     return False
+        return True
+
+    def _filters(self, idx, ignore_metadata=False):
+        sec, e = self.pack.flat[idx]
+        if not ignore_metadata and not self._metadata_matches(sec, e):
+            return False
         tr = e.get("translation", "")
-        b, _ = parse_text(tr)
-        non = any(st == "nonascii" for _, _, st in parse_text(tr)[1])
         st = self.filter_status
         if st == "Untranslated" and tr:
             return False
@@ -192,6 +204,7 @@ class FindFilterMixin:
             return False
         if st in ("Won't fit", "Grows (free space)"):
             want = "over" if st == "Won't fit" else "grows"
+            b, _ = parse_text(tr)
             if not tr or space_verdict(sec, e, b) != want:
                 return False
         if st == "Overdraw (source)":
@@ -200,8 +213,9 @@ class FindFilterMixin:
         if st == "Overdraw (translation)":
             if not (tr and self.row_overdraw(idx, tr)[1]):
                 return False
-        if st == "Has non-ASCII" and not non:
-            return False
+        if st == "Has non-ASCII":
+            if not any(style == "nonascii" for _, _, style in parse_text(tr)[1]):
+                return False
         if self.filter_text:
             t = self.filter_text.lower()
             if t not in self._scope_haystack(e).lower():
@@ -322,4 +336,3 @@ class FindFilterMixin:
         vals = list(self.st_cb["values"])
         self.st_cb.set(status if status in vals else "All")
         self.rebuild_view()
-

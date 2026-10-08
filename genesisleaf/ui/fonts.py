@@ -72,9 +72,6 @@ def init_fonts(root, family=FONT_DEFAULT_FAMILY, size=None):
         except tk.TclError:
             pass
 
-def set_font_size(root, size):
-    init_fonts(root, font_family(), size)
-
 def font_family():
     return _FONT_FAMILY
 

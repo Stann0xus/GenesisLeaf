@@ -100,7 +100,8 @@ def expand_bytes(text, expander=None, unresolved=None):
                     if expander:
                         name = expander(0xC1, inner)
                         if name is None:
-                            unresolved.append((0xC1, inner))
+                            if unresolved is not None:
+                                unresolved.append((0xC1, inner))
                         else:
                             out.extend(c for c in name if c != 0)
                     j += 2
@@ -169,56 +170,12 @@ def walk_bytes(text, glyph_pad=0, expander=None, numeric_digits=4,
     return line_widths, max_px, unresolved, items
 
 
-def preview_bytes(text, glyph_pad=0, expander=None, numeric_digits=4,
-                  start_pal=DEFAULT_PALETTE, accent_font=False):
-    """The single-line renderer's glyphs, with ink colour: expands and walks
-    exactly like [`walk_bytes`] but also tracks the `0xCF` colour (starting at
-    DEFAULT_PALETTE, the ink retail stages for a normal dialog string) so a
-    preview drawn from these items is as wide as the measure and coloured like
-    retail.  Items are
-    (line, x, width, kind, byte_or_width, palette); kind 'g'/'e'.
-    With `accent_font` the accent width table drives the pen."""
-    unresolved = []
-    expanded = expand_bytes(text, expander, unresolved)
-    widths = _accent_widths() if accent_font else FONT_WIDTHS
-    line_widths = []
-    pen = 0
-    items = []
-    pal = start_pal
-    i = 0
-    while i < len(expanded):
-        c = expanded[i]
-        if c < FIRST_CHAR:
-            break
-        if c == NEWLINE:
-            line_widths.append(pen)
-            pen = 0
-            i += 1
-            continue
-        if is_two_byte(c):
-            arg = expanded[i + 1] if i + 1 < len(expanded) else 0
-            if c == 0xCE:
-                kind, w = escape_px(arg, numeric_digits)
-                items.append((len(line_widths), pen, w, "e", arg, pal))
-                pen += w
-            elif c == 0xCF:
-                pal = arg & 0xFF
-            i += 2
-            continue
-        items.append((len(line_widths), pen, font_advance(c, widths) + glyph_pad,
-                      "g", c, pal))
-        pen += font_advance(c, widths) + glyph_pad
-        i += 1
-    line_widths.append(pen)
-    return line_widths, max(line_widths) if line_widths else 0, items
-
-
 def measure_markup(text, glyph_pad=0, expander=None, numeric_digits=4,
                    accent_font=False):
     """Measure a pack-format markup string (the editor's normal text form).
     Encodes the markup to MES bytes exactly as the importer would (mirroring
     parse_text's rules), then expands + walks.  Returns
-    (encoded_bytes, line_widths, max_px, unresolved, pen_items).
+    (encoded_bytes, line_widths, max_px, unresolved, pen_items, bad_characters).
     With `accent_font` the accent width table drives the pen."""
     bs = []
     bad = []
@@ -230,7 +187,7 @@ def measure_markup(text, glyph_pad=0, expander=None, numeric_digits=4,
         elif st == "newline":
             bs.append(0x7C)
         elif st == "fold":
-            bs.append(ord(ascii_fold(seg)))
+            bs.extend(ord(ch) for ch in ascii_fold(seg))
         elif st == "high_byte":
             # Map each CP437 character to its high-byte value
             for ch in seg:

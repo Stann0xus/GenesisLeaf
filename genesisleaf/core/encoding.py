@@ -45,8 +45,8 @@ SUB_OPCODES = {"c1": 0xC1, "c2": 0xC2, "c3": 0xC3, "c4": 0xC4,
 # shows these regardless of what the pack translated.
 C7_NAMES = ("Meta", "Terra", "Ozma")
 
-# Characters the importer folds onto a single ASCII byte automatically.
-# Includes smart punctuation, dashes, ellipsis, NBSP.
+# Characters the importer folds onto ASCII bytes automatically. Most become
+# one byte; the ellipsis expands to three periods.
 FOLD_CHARS = set(
     "\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f"  # smart single/double quotes
     "\u2013\u2014"        # en/em dash
@@ -192,9 +192,7 @@ ACCENT_FOLD = {
     '\u00bb': '"',   # »
 }
 
-# (style) used by the editor's syntax highlighter
-STYLE_SUB = ("sub",)          # {c1:..} {c2:..} {c3:..} {c5:..} {c7:..} substitutions
-STYLE_CTL = ("ctl",)          # {cf:..} {ce:..}
+# The editor consumes the span style strings returned by parse_text directly.
 
 
 def parse_text(s):
@@ -220,7 +218,7 @@ def _parse_text(s):
       {c1|2|3|4|5|7}:..   2 bytes   (bare {c1} = 1 byte)
       {cf|ce}:..          2 bytes   (bare = 1 byte)
       {7b}/{7d} braces    1 byte
-      smart quotes/dash/ellipsis/NBSP -> folded to 1 ASCII byte
+      smart quotes/dash/NBSP -> 1 ASCII byte; ellipsis -> 3 ASCII bytes
       drawn Latin cell (CP437_MAP) -> 1 high byte
       fold-only Latin letter (ACCENT_FOLD) -> folded to ASCII
       any other non-ASCII -> NOT ENCODABLE (still counted 1 byte for display)
@@ -271,12 +269,12 @@ def _parse_text(s):
             i += 1
             continue
         if ch in FOLD_CHARS:
-            total += 1
+            total += 3 if ch == "\u2026" else 1
             spans.append((i, i + 1, "fold"))
             i += 1
             continue
         if ch in ACCENT_FOLD:
-            total += 1
+            total += len(ACCENT_FOLD[ch])
             spans.append((i, i + 1, "fold"))
             i += 1
             continue

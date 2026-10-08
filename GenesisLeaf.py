@@ -3,7 +3,7 @@
 Guidelines: https://andrewaltimit.github.io/legend-of-legaia-re/tooling/translation.html
 
 Usage:
-    python GenesisLeaf.py [pack.yaml]
+    python GenesisLeaf.py [--verbose | --debug] [pack.yaml]
 
 Requires: Python 3.8+, PyYAML, tkinter (standard on Windows); Pillow is
 optional but strongly recommended (real-font preview, icon artwork).

@@ -56,6 +56,9 @@ PALETTES = {
     9: (222, 90, 0),      # orange - critical tier, moves header
 }
 
+# Previews only: ink 1 is blue on the blue dialog box and unreadable there.
+PREVIEW_INK_FIX = {1: (255, 226, 90)}
+
 # window chrome the retail dialog window uses when it draws a box row
 PV_RIM = (0xB8, 0xC0, 0xD8)
 PV_BG = (0x10, 0x18, 0x48)
@@ -75,10 +78,17 @@ PV_SCENE = (0, 0, 0)
 
 
 # -- live preview scheme ------------------------------------------------------
+def preview_inks():
+    """PALETTES with the readability overrides applied (blue -> yellow)."""
+    inks = dict(PALETTES)
+    inks.update(PREVIEW_INK_FIX)
+    return inks
+
+
 def retail_scheme(white=PV_WHITE):
     """The game's own dialog window: dark blue box, light rim, retail inks.
     `white` is the ink used for {cf:08} / untinted icons."""
-    inks = dict(PALETTES)
+    inks = preview_inks()
     inks[8] = tuple(white)
     return {"rim": PV_RIM, "bg": PV_BG, "past": PV_PAST, "limit": PV_LIMIT,
             "fill_top": PV_FILL_TOP, "fill_bot": PV_FILL_BOT,

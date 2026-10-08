@@ -5,12 +5,15 @@ Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 
 import tkinter as tk
 import tkinter.font as tkfont
+from time import perf_counter
 from tkinter import ttk
 
 from genesisleaf.core.encoding import bad_cf_codes, parse_text
 from genesisleaf.core.space import verdict as space_verdict
+from genesisleaf.diagnostics import current as current_diagnostics
 from genesisleaf.ui.cellsel import CellSelection
 from genesisleaf.ui.widgets import TreeRowTip
+from genesisleaf.ui.virtual_tree import VirtualTreeview
 from genesisleaf.ui.fonts import FONT_UI_B, FONT_UI_SM, font_family, font_size
 from genesisleaf.ui import theme as _theme
 from genesisleaf.ui.app.notes import NOTE_MARK
@@ -28,7 +31,7 @@ class TableMixin:
         f.columnconfigure(0, weight=1)
         f.rowconfigure(1, weight=1)
 
-        self.tree = ttk.Treeview(
+        self.tree = VirtualTreeview(
             f,
             columns=("ord", "st", "note", "sec", "key", "context", "source",
                      "tr", "bytes"),
@@ -49,7 +52,10 @@ class TableMixin:
         self.tree.column("ord", anchor="e")
         vs = ttk.Scrollbar(f, orient="vertical", command=self.tree.yview)
         hs = ttk.Scrollbar(f, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        self._tree_vs = vs
+        self._tree_y_range = None
+        self.tree.configure(yscrollcommand=self._on_tree_yscroll,
+                            xscrollcommand=hs.set)
         self.tree.grid(row=1, column=0, sticky="nsew")
         vs.grid(row=1, column=1, sticky="ns")
         hs.grid(row=2, column=0, sticky="ew")
@@ -92,6 +98,10 @@ class TableMixin:
                                      on_copy=self._push_clip_history)
         return f
 
+    def _on_tree_yscroll(self, first, last):
+        self._tree_y_range = (float(first), float(last))
+        self._tree_vs.set(first, last)
+
     def rebuild_view(self):
         self.filter_section = self.sec_cb.get() or "All"
         self.filter_status = self.st_cb.get() or "All"
@@ -119,19 +129,40 @@ class TableMixin:
                 except Exception:
                     boxed.add(i)
             idxs = sorted(boxed)
+        old_count = len(self._pos_iids)
         self.view_iid = {}
         self._iid_by_flat = {}
         self._pos_iids = []
+        self._pos_by_iid = {}
+        self._tree_auto_selection = None
+        self._tree_y_range = None
         self._band_of = {}
         self._band_state = {"unit": None, "n": 0}
         if self._sort_col:
             idxs = sorted(idxs, key=self._sort_key, reverse=self._sort_rev)
         self.plan = [("r", i) for i in idxs]
         self.view = [i for t, i in self.plan if t == "r"]
+        self._table_build_started = perf_counter()
+        self._view_pos_by_flat = {i: pos for pos, i in enumerate(self.view)}
         self.cellsel.clear()           # the row iids are about to change
+        # A mapped Treeview repaints after every insertion batch. With tens
+        # of thousands of rows that idle repaint costs far more than the
+        # batch itself. Keep it unmapped until the new rows are complete.
+        if max(old_count, len(self.view)) > 2000 and not getattr(
+                self, "_tree_bulk_hidden", False):
+            self.tree.grid_remove()
+            self._tree_bulk_hidden = True
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("TABLE_BUILD_START", rows=len(self.view),
+                          previous_rows=old_count,
+                          hidden=bool(getattr(self, "_tree_bulk_hidden", False)))
         self.tree.delete(*self.tree.get_children())
         self._refresh_ctx_filter()
         if not self.view:
+            self._show_bulk_tree()
+            self._table_build_done()
+            self.tree.refresh_scrollbar()
             self.update_status()
             self.nav_lab.configure(text="0 shown")
             self._update_empty_state()
@@ -298,17 +329,42 @@ class TableMixin:
         return "band_a" if st["n"] % 2 else "band_b"
 
     def _insert_plan(self, k, gen):
-        CHUNK = 1200
-        end = min(k + CHUNK, len(self.plan))
-        for t, x in self.plan[k:end]:
+        if gen != self._view_gen:
+            return
+        deadline = perf_counter() + 0.008
+        end = k
+        while end < min(k + 512, len(self.plan)):
+            t, x = self.plan[end]
             self.tree_insert_row(x)
-        self.tree.configure(cursor="")
+            end += 1
+            if end % 32 == 0 and perf_counter() >= deadline:
+                break
         if end < len(self.plan):
-            self.root.after_idle(lambda: self._finish_insert(end, gen))
+            # A timer yields to painting/input; chained idle callbacks can all
+            # run inside update_idletasks and defeat the loading overlay.
+            self.root.after(1, lambda: self._finish_insert(end, gen))
         elif gen == self._view_gen:
+            self.tree.configure(cursor="")
+            if self.current < 0 and self.view:
+                self._select_view(0)
+            self._show_bulk_tree()
+            self._table_build_done()
+            self.tree.refresh_scrollbar()
             # the last chunk is in the tree - if a load is still showing its
             # overlay, this is the moment it may close
             self._finish_loading()
+
+    def _show_bulk_tree(self):
+        if getattr(self, "_tree_bulk_hidden", False):
+            self._tree_bulk_hidden = False
+            self.tree.grid()
+
+    def _table_build_done(self):
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("TABLE_BUILD_READY", rows=len(self._pos_iids),
+                          elapsed_ms=round((perf_counter() - self._table_build_started)
+                                           * 1000, 3))
 
     def _finish_insert(self, end, gen):
         if gen != self._view_gen:
@@ -316,7 +372,7 @@ class TableMixin:
         self._insert_plan(end, gen)
 
     def _row_state(self, i):
-        """`(mark, tag, bytes, budget, translation)` for one flat row.
+        """`(mark, tag, bytes, budget, translation, overdraw)` for one flat row.
 
         The single source of truth for both the first render
         (`tree_insert_row`) and every keystroke afterwards
@@ -326,10 +382,10 @@ class TableMixin:
         """
         sec, e = self.pack.flat[i]
         tr = e.get("translation", "")
-        b, _ = parse_text(tr)
+        b, spans = parse_text(tr)
         sb, _ = parse_text(e.get("source", ""))
         budget = int(e.get("budget", sb))
-        non = any(st == "nonascii" for _, _, st in parse_text(tr)[1])
+        non = any(st == "nonascii" for _, _, st in spans)
         v = space_verdict(sec, e, b) if tr else "fits"
         badcf = bool(bad_cf_codes(tr))
         if badcf:
@@ -378,6 +434,7 @@ class TableMixin:
         self._band_of[iid] = band
         self.view_iid[iid] = i
         self._iid_by_flat[i] = iid
+        self._pos_by_iid[iid] = len(self._pos_iids)
         self._pos_iids.append(iid)
         return iid
 
@@ -410,16 +467,14 @@ class TableMixin:
         # flip the stripes, because a single re-render is not a full pass over
         # the units in view order
         band = self._band_of.get(iid)
-        self.tree.item(iid, tags=self._row_tags(tag, over, band))
-        self.tree.set(iid, "ord", i + 1)
+        sec, entry = self.pack.flat[i]
         # the cells too, not just the colour: the mark, the visible
         # translation and the byte counter are the whole point of watching the
         # table while you type
-        self.tree.set(iid, "st", mark)
-        self.tree.set(iid, "note",
-                      NOTE_MARK if self.pack.flat[i][1].get("notes") else "")
-        self.tree.set(iid, "tr", tr)
-        self.tree.set(iid, "bytes", "%d/%d" % (b, budget))
+        self.tree.item(iid, tags=self._row_tags(tag, over, band), values=(
+            i + 1, mark, NOTE_MARK if entry.get("notes") else "", sec,
+            entry.get("key", ""), entry.get("context", ""),
+            entry.get("source", ""), tr, "%d/%d" % (b, budget)))
         # Live sync: every data change in the program passes through here, so
         # this is the one place that has to tell the other view windows.  A
         # view ignores the notification while it is the one that made the

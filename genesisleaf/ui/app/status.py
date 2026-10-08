@@ -4,11 +4,14 @@ Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 """
 
 import os
+import threading
 import tkinter as tk
 from tkinter import ttk
 
 from genesisleaf.core import space as _space
 from genesisleaf.core.encoding import parse_text
+from genesisleaf.core.pack import Pack
+from genesisleaf.diagnostics import current as current_diagnostics
 from genesisleaf.ui.fonts import FONT_UI_SM
 from genesisleaf.ui import theme as _theme
 
@@ -30,6 +33,12 @@ class StatusMixin:
                             font=FONT_UI_SM, foreground=_theme.TH_FG_MUTED,
                             style="Chrome.TLabel")
         self.sb.pack(side="left", fill="x", expand=True)
+        self.diagnostic_label = None
+        if current_diagnostics() is not None:
+            self.diagnostic_label = ttk.Label(
+                s, text="UI starting", anchor="e", font=FONT_UI_SM,
+                foreground=_theme.TH_FG_MUTED, style="Chrome.TLabel")
+            self.diagnostic_label.pack(side="right", padx=(10, 0))
         self.sb2 = ttk.Label(s, text="", anchor="e", font=FONT_UI_SM,
                              foreground=_theme.TH_FG_MUTED,
                              style="Chrome.TLabel")
@@ -54,8 +63,10 @@ class StatusMixin:
         return self._stats
 
     def invalidate_stats(self):
-        self._stats = None
-        self._space_est = None
+        self._stats_gen = getattr(self, "_stats_gen", 0) + 1
+        self._space_stale_key = (id(self.pack),
+                                 id(_space.MEASURED["snapshot"]), self._stats_gen)
+        self._space_stale_value = True
         if self._stats_job:
             try:
                 self.root.after_cancel(self._stats_job)
@@ -64,12 +75,52 @@ class StatusMixin:
         self._stats_job = self.root.after(600, self._stats_recompute)
 
     def _stats_recompute(self):
-        self._stats = None
-        self._space_est = None
-        try:
+        self._stats_job = None
+        previous = getattr(self, "_stats_worker", None)
+        if previous is not None and previous.is_alive():
+            # An older edit is still being counted. Let it finish before
+            # starting the latest snapshot, so typing cannot stack scans.
+            self._stats_job = self.root.after(100, self._stats_recompute)
+            return
+        gen = self._stats_gen
+        # Snapshot on Tk's thread, then calculate the expensive per-entry
+        # counts in a worker. Edits that arrive meanwhile discard this result.
+        rows = [(sec, dict(entry)) for sec, entry in self.pack.flat]
+        measured = _space.MEASURED["snapshot"]
+        result = {}
+
+        def work():
+            try:
+                snapshot = Pack()
+                snapshot.flat = rows
+                result["stats"] = snapshot.stats()
+                result["space_est"] = _space.estimate(snapshot)
+                if measured:
+                    result["space_stale"] = any(
+                        measured.get(entry.get("key", "")) != entry.get("translation", "")
+                        for _sec, entry in rows)
+            except Exception as exc:  # cache refresh is best effort
+                result["error"] = exc
+
+        worker = threading.Thread(target=work, daemon=True)
+        self._stats_worker = worker
+        worker.start()
+        self.root.after(50, lambda: self._stats_poll(worker, result, gen))
+
+    def _stats_poll(self, worker, result, gen):
+        if not worker.is_alive() and getattr(self, "_stats_worker", None) is worker:
+            self._stats_worker = None
+        if gen != self._stats_gen:
+            return
+        if worker.is_alive():
+            self.root.after(50, lambda: self._stats_poll(worker, result, gen))
+            return
+        if "stats" in result and "space_est" in result:
+            self._stats = result["stats"]
+            self._space_est = result["space_est"]
+            if "space_stale" in result:
+                self._space_stale_value = result["space_stale"]
             self.update_status()
-        except Exception:
-            pass
 
     # -- status -------------------------------------------------------------------
     def update_status(self):

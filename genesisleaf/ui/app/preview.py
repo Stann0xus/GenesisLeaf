@@ -12,7 +12,9 @@ from genesisleaf.core.encoding import C7_NAMES, TOKEN_RE, parse_text
 from genesisleaf.core.legend import TOKEN_DOCS
 from genesisleaf.core import palette as _palette
 from genesisleaf.core.palette import CF_MAX
-from genesisleaf.ui.canvas_render import render_text_to_canvas
+from genesisleaf.ui.canvas_render import (
+    reposition_canvas_preview,
+)
 from genesisleaf.ui.fonts import FONT_MONO, pick_jp_family
 from genesisleaf.ui.theme import apply_preview_scheme
 
@@ -159,18 +161,20 @@ class PreviewMixin:
             except (tk.TclError, ValueError):
                 pass
             self._dyn_resize_job = None
-        self._dyn_resize_job = self.root.after(80, self._run_dyn_resize)
+        self._dyn_resize_job = self.root.after(16, self._run_dyn_resize)
 
     def _run_dyn_resize(self):
         self._dyn_resize_job = None
         if getattr(self, "dyn_var", None) and self.dyn_var.get():
-            self._draw_dyn_preview()
+            if not reposition_canvas_preview(self.dyn_cv):
+                self._draw_dyn_preview()
             self._refresh_pv_guide()
 
     def _draw_dyn_preview(self):
         cv = self.dyn_cv
-        cv.delete("all")
         if self.current < 0:
+            self.preview_queue.cancel(cv)
+            cv.delete("all")
             return
         sec = self.pack.flat[self.current][0]
         ctx = self._dock_limit_context(sec)
@@ -201,18 +205,29 @@ class PreviewMixin:
             row_positions = [bmap.get(i, (0, 0))[1] for i in idxs]
 
         try:
-            render_text_to_canvas(cv, rows, meta,
-                                  expander=self.markup_expander(),
-                                  scale=getattr(self, "pv_scale", 2),
-                                  row_positions=row_positions,
-                                  accent_font=self.accent_font_var.get(),
-                                  fallback_font=self.jp_font(
-                                      getattr(self, "pv_scale", 2)),
-                                  rf_config=getattr(self, "rf_config", None))
+            self.preview_queue.request(cv, rows, meta,
+                                       expander=self.markup_expander(),
+                                       scale=getattr(self, "pv_scale", 2),
+                                       row_positions=row_positions,
+                                       accent_font=self.accent_font_var.get(),
+                                       fallback_font=self.jp_font(
+                                           getattr(self, "pv_scale", 2)),
+                                       rf_config=getattr(self, "rf_config", None))
         except Exception:
             pass
 
+    def schedule_preview(self, delay=80):
+        """Keep typing responsive; render the latest editor state once per burst."""
+        pending = getattr(self, "_preview_job", None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+        self._preview_job = self.root.after(delay, self.update_preview)
+
     def update_preview(self):
+        pending = getattr(self, "_preview_job", None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+            self._preview_job = None
         if not hasattr(self, "prev_txt"):
             return
         self._draw_float_preview()

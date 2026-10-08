@@ -63,6 +63,27 @@ def _hole_positions(markup, holes, glyph_pad, expander, numeric_digits,
                     accent_font=False):
     """(line, x, char) for each fallback character of a `_preview_markup`
     row, at the pen position the walk reaches there."""
+    if (holes and type(glyph_pad) is int
+            and all(0x20 <= ord(ch) < 0x7f and ch not in "{^" for ch in markup)
+            and all(0 <= at <= len(markup) for at, _ch in holes)):
+        # Plain fallback rows contain spaces where CJK glyphs will be drawn.
+        # No escape/substitution can affect this pen, so walk it once instead
+        # of encoding every progressively longer prefix. Rich markup keeps
+        # the full walker below, including its callback/error semantics.
+        widths = _accent_widths() if accent_font else FONT_WIDTHS
+        wanted = {at for at, _ch in holes}
+        positions = {}
+        line = x = 0
+        for at, ch in enumerate(markup):
+            if at in wanted:
+                positions[at] = (line, x)
+            if ch == "|":
+                line += 1
+                x = 0
+            else:
+                x += font_advance(ord(ch), widths) + glyph_pad
+        positions[len(markup)] = (line, x)
+        return [(positions[at][0], positions[at][1], ch) for at, ch in holes]
     out = []
     for at, ch in holes:
         head = markup[:at]

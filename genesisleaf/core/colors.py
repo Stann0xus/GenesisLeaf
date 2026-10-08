@@ -46,8 +46,8 @@ def rel_lum(c):
     """WCAG relative luminance of a colour, 0.0 (black) to 1.0 (white)."""
     r, g, b = hex_to_rgb(c)
     return (0.2126 * _channel_luminance(r) +
-            0.872 * _channel_luminance(g) +
-            0.0152 * _channel_luminance(b))
+            0.7152 * _channel_luminance(g) +
+            0.0722 * _channel_luminance(b))
 
 
 def contrast(fg, bg):
@@ -61,10 +61,6 @@ def mix(c, target, t):
     """Blend `c` toward `target` by `t` (0.0 = c, 1.0 = target)."""
     a, b = hex_to_rgb(c), hex_to_rgb(target)
     return rgb_to_hex([a[i] + (b[i] - a[i]) * t for i in range(3)])
-
-
-def lighten(c, t):
-    return mix(c, "#ffffff", t)
 
 
 def darken(c, t):
@@ -88,15 +84,3 @@ def readable_on(fg, bg, minimum=4.5):
         if contrast(cand, bg) >= minimum:
             return cand
     return pole
-
-
-def selection_pair(bg, fg, base_bg, minimum=4.5):
-    """A readable selection background/foreground pair for a panel colour.
-
-    Selections used to keep Tk's stock highlight, which on a dark theme is a
-    glaring block that swallows the text.  Here the selected row is a *muted*
-    shift of the panel colour (so it reads as "same surface, marked") and the
-    text on it is forced to a legible contrast."""
-    sel_bg = mix(bg, readable_on(base_bg, bg), 0.22)
-    sel_fg = readable_on(fg, sel_bg, minimum)
-    return sel_bg, sel_fg

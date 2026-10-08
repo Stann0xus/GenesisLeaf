@@ -11,6 +11,7 @@ from tkinter import messagebox, ttk
 
 from genesisleaf.core.history import EditHistory
 from genesisleaf.core.pack import Pack
+from genesisleaf.ui.quiet import install as quiet_configure
 from genesisleaf.ui.app.appearance import AppearanceMixin
 from genesisleaf.ui.app.autofix import AutofixMixin
 from genesisleaf.ui.app.cheatsheet import CheatsheetMixin
@@ -46,8 +47,12 @@ from genesisleaf.ui.app.undo import UndoMixin
 from genesisleaf.ui.app.views import ViewsMixin
 from genesisleaf.ui.app.workbench_link import WorkbenchLinkMixin
 from genesisleaf.ui.fonts import font_family, init_fonts
+from genesisleaf.ui.canvas_render import CanvasRenderQueue
 from genesisleaf.ui import brand
 from genesisleaf.version import APP_TITLE
+
+
+_AUTO_PACK = object()
 
 
 class App(
@@ -93,8 +98,10 @@ class App(
     handler.  See docs/FEATURE_MAP.md for how the mixins call each other.
     """
 
-    def __init__(self, root):
+    def __init__(self, root, pack_path=_AUTO_PACK):
+        quiet_configure()
         self.root = root
+        self.preview_queue = CanvasRenderQueue(root)
         init_fonts(root, font_family())
         self.pack = Pack()
         self.dirty = False
@@ -104,6 +111,8 @@ class App(
         self._iid_by_flat = {}         # flat index -> iid (the reverse, so the
                                        # per-keystroke row refresh is O(1)
                                        # rather than a scan of every row)
+        self._pos_by_iid = {}          # visible tree position for keyboard steps
+        self._view_pos_by_flat = {}    # flat index -> filtered/sorted view position
         self.filter_section = "All"
         self.filter_status = "All"
         self.filter_context = "All"
@@ -152,6 +161,7 @@ class App(
         self._ed_prev = []          # prior per-line display values, for write-back
         self.max_ed_lines = 10      # unchecked-mode editor cap (Options)
         self._join = {}             # unit source-signature -> [unit, ...] joined units
+        self._join_groups_ready = False
         self._join_unit_cache = None  # every multi-line unit, flat order
         self._band_of = {}          # tree iid -> the band tag it was drawn on
         self._band_state = {"unit": None, "n": 0}   # stripe flip, per rebuild
@@ -224,7 +234,8 @@ class App(
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        path = sys.argv[1] if len(sys.argv) > 1 else None
+        path = (sys.argv[1] if len(sys.argv) > 1 else None) \
+            if pack_path is _AUTO_PACK else pack_path
         if path and os.path.exists(path):
             self.root.after(200, lambda: self.load_pack(path))
         else:
@@ -242,5 +253,9 @@ class App(
             except Exception:
                 pass
         self._cancel_join()
+        self.preview_queue.close()
         self._close_all_views()
+        self.pack.close()
+        if self.other is not None:
+            self.other.close()
         self.root.destroy()

@@ -16,7 +16,7 @@ Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 # render() does.  It was generated from this disc and byte-verified against
 # translate_workbench.rs::render outputs.
 # ---------------------------------------------------------------------------
-FONT_VRAM_X16 = 896          # fb x of the font page on the retail VRAM
+# The font page's retail VRAM framebuffer x coordinate is 896.
 ATLAS_W = 224
 ATLAS_H = 210
 GLYPH_W = 14
@@ -88,5 +88,4 @@ FONT_ESCAPES = (
 INTER_GLYPH_PAD = 1
 FIRST_CHAR = 32
 NEWLINE = 124
-DIALOG_GLYPH_PAD = 1
 NUMERIC_DIGIT_PX = 8

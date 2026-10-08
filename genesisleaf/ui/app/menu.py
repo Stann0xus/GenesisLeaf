@@ -5,7 +5,7 @@ Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 
 import tkinter as tk
 
-from genesisleaf.ui.theme import CLASSIC_THEMES
+from genesisleaf.ui.theme import SECTION_BREAKS, THEME_SECTIONS
 from genesisleaf.ui import theme as _theme
 from genesisleaf.ui.menubar import Menubar
 
@@ -105,7 +105,6 @@ class MenuMixin:
         self._edit_menu = em
 
         tl = tk.Menu(m, tearoff=0)
-        tl.add_command(label="Cheatsheet", command=lambda: self.open_tool("cheatsheet"))
         tl.add_command(label="Playground", command=lambda: self.open_tool("playground"))
         tl.add_separator()
         tl.add_command(label="Workbench (measuring editor)",
@@ -142,11 +141,18 @@ class MenuMixin:
             state="normal" if getattr(self, "_skin_ok", False) else "disabled")
         self.themes_menu = tk.Menu(om, tearoff=0)
         self._theme_var = tk.StringVar(value=_theme.CLASSIC_THEME)
-        for name in CLASSIC_THEMES:
-            self.themes_menu.add_radiobutton(
-                label=name, value=name, variable=self._theme_var,
-                command=lambda n=name: self.set_theme(n))
-        om.add_cascade(label="Classic palette", menu=self.themes_menu)
+
+        for section, themes in THEME_SECTIONS.items():
+            section_menu = tk.Menu(self.themes_menu, tearoff=0)
+            breaks = SECTION_BREAKS.get(section, ())
+            for theme_name in themes:
+                if theme_name in breaks:
+                    section_menu.add_separator()
+                section_menu.add_radiobutton(
+                    label=theme_name, value=theme_name, variable=self._theme_var,
+                    command=lambda n=theme_name: self.set_theme(n))
+            self.themes_menu.add_cascade(label=section, menu=section_menu)
+        om.add_cascade(label="Colour palette", menu=self.themes_menu)
         om.add_command(label="Edit function-key macros...",
                        command=self.open_macro_editor)
         om.add_command(label="Reset macros to defaults",
@@ -173,7 +179,7 @@ class MenuMixin:
         hm = tk.Menu(m, tearoff=0)
         hm.add_command(label="User guide", command=self.open_user_guide)
         hm.add_command(label="Keyboard shortcuts", command=self.show_shortcuts)
-        hm.add_command(label="Markup cheatsheet",
+        hm.add_command(label="Cheatsheet",
                        command=lambda: self.open_tool("cheatsheet"))
         hm.add_separator()
         hm.add_command(label="About / credits", command=self.show_credits)

@@ -103,12 +103,12 @@ class NavigationMixin:
         if not data:
             return
         i, tries = data
-        for iid, fi in list(self.view_iid.items()):
-            if fi == i:
-                self.tree.selection_set(iid)
-                self.tree.see(iid)
-                self._jump_data = None
-                return
+        iid = self._iid_of(i)
+        if iid is not None:
+            self.tree.selection_set(iid)
+            self._see_if_needed(iid)
+            self._jump_data = None
+            return
         if tries > 0:
             self._jump_data = (i, tries - 1)
             self.root.after(80, self._reveal_jump)
@@ -131,10 +131,7 @@ class NavigationMixin:
             self._select_view(nxt)
 
     def _view_pos(self):
-        for pos, i in enumerate(self.view):
-            if i == self.current:
-                return pos
-        return -1
+        return self._view_pos_by_flat.get(self.current, -1)
 
     def _select_view(self, pos):
         if not (0 <= pos < len(self.view)):
@@ -145,7 +142,7 @@ class NavigationMixin:
         # off-screen reads as a frozen table.
         iid = self._iid_of(i)
         if iid is not None:
-            self.tree.see(iid)
+            self._see_if_needed(iid)
         self.select_entry(i)
         self._select_lock = True
         try:

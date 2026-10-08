@@ -42,13 +42,13 @@ class EditorMixin:
 
         `sel_rows` lets a view window pass its own table selection; the main
         window defaults to its own."""
-        if sel_rows is None:
-            sel_rows = self._selected_flat_in_order()
         if self.multi_var.get():
             if 0 <= idx < len(self.pack.flat):
                 rows = [i for i in self.box_rows(idx)
                         if 0 <= i < len(self.pack.flat)]
                 return rows or [idx]
+        if sel_rows is None:
+            sel_rows = self._selected_flat_in_order()
         rows = [i for i in sel_rows if 0 <= i < len(self.pack.flat)]
         if idx not in rows:
             rows = [idx]
@@ -86,6 +86,9 @@ class EditorMixin:
         w._flat_idx = None
         w._ed_flat = rows
         w._ed_prev = list(vals)
+        # Replacing all text invalidates Tk's tag ranges even when the new
+        # string happens to equal the previous editor contents.
+        w._tag_content = None
         w.configure(state="normal")
         w.delete("1.0", "end")
         if n:
@@ -208,6 +211,7 @@ class EditorMixin:
             w.configure(state="normal")
             w.delete("1.0", "end")
             w.insert("1.0", "\n".join(lines))
+            w._tag_content = None
             w.edit_modified(False)
             w.edit_reset()
             w.mark_set("insert", "%d.0" % min(max(1, caret_line), len(lines)))
@@ -296,15 +300,27 @@ class EditorMixin:
 
     def retag(self, w, allow_over=False, idx=None):
         content = w.get("1.0", "end-1c")
-        for tag in ("nonascii", "fold", "newline", "byte", "esc2", "sub",
-                    "ctl", "over"):
-            w.tag_remove(tag, "1.0", "end")
-        if content:
-            _, spans = parse_text(content)
+        previous = getattr(w, "_tag_content", None)
+        if previous != content:
+            start, end, fragment = "1.0", "end", content
+            if previous is not None:
+                before, after = previous.split("\n"), content.split("\n")
+                if len(before) == len(after):
+                    changed = [n for n, pair in enumerate(zip(before, after))
+                               if pair[0] != pair[1]]
+                    if changed:
+                        first, last = changed[0], changed[-1]
+                        start, end = "%d.0" % (first + 1), "%d.0" % (last + 2)
+                        fragment = "\n".join(after[first:last + 1])
+            for tag in ("nonascii", "fold", "newline", "byte", "esc2", "sub", "ctl"):
+                w.tag_remove(tag, start, end)
+            _, spans = parse_text(fragment)
             for s, e_, st in spans:
                 if st == "ascii":
                     continue
-                w.tag_add(st, "1.0+%dc" % s, "1.0+%dc" % e_)
+                w.tag_add(st, "%s+%dc" % (start, s), "%s+%dc" % (start, e_))
+            w._tag_content = content
+        w.tag_remove("over", "1.0", "end")
         if not allow_over:
             return
         flat = getattr(w, "_ed_flat", [])
@@ -341,8 +357,7 @@ class EditorMixin:
             return
         self._tr_modified_common(w)
         self._bytes_label()
-        self.invalidate_stats()
-        self.update_preview()
+        self.schedule_preview()
 
     def _bind_editor_keys(self, w):
         """Every binding a translation editor needs, in one place.
@@ -474,6 +489,7 @@ class EditorMixin:
                 return
             w.delete("1.0", "end")
             w.insert("1.0", s)
+            w._tag_content = None
             w.edit_modified(True)
             self.on_tr_modified()
         finally:

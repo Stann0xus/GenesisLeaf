@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox
 from genesisleaf.core.pack import Pack, needs_accent_font, save_pack
 from genesisleaf.core.textfix import round_1
 from genesisleaf.core import space as _space
+from genesisleaf.diagnostics import current as current_diagnostics
 from genesisleaf.ui.loader import BusyOverlay
 from genesisleaf.version import APP_REVISION, APP_TITLE
 
@@ -43,6 +44,10 @@ class PackIOMixin:
         if getattr(self, "_loading", False):
             self.flash("still loading the previous file")
             return
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("PACK_OPEN", file=os.path.basename(path),
+                          bytes=os.path.getsize(path) if os.path.isfile(path) else None)
         self._finish_loading()               # drop any stale overlay
         self._loader = BusyOverlay(self.root, "Loading pack",
                                    os.path.basename(path))
@@ -51,11 +56,17 @@ class PackIOMixin:
         outcome = {}
 
         def work():
+            fresh = None
             try:
                 fresh = Pack()
                 fresh.load(path)
+                outcome["box_map"] = fresh.dialog_box_map()
+                outcome["stats"] = fresh.stats()
+                outcome["space_est"] = _space.estimate(fresh)
                 outcome["pack"] = fresh
             except Exception as e:                  # noqa: BLE001 - shown to user
+                if fresh is not None:
+                    fresh.close()
                 outcome["err"] = e
 
         th = threading.Thread(target=work, daemon=True)
@@ -74,7 +85,21 @@ class PackIOMixin:
             self._finish_loading()
             messagebox.showerror("Load error", str(outcome["err"]))
             return
+        old_pack = self.pack
         self.pack = outcome["pack"]
+        old_pack.close()
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("PACK_READY", file=os.path.basename(path),
+                          entries=len(self.pack.flat),
+                          sections=len(self.pack.section_names))
+        self._stats_gen = getattr(self, "_stats_gen", 0) + 1
+        if self._stats_job is not None:
+            self.root.after_cancel(self._stats_job)
+            self._stats_job = None
+        self._stats = outcome["stats"]
+        self._space_est = outcome["space_est"]
+        self._loaded_box_map = outcome["box_map"]
         if self._loader is not None:
             self._loader.set_message("Building table",
                                      os.path.basename(path))
@@ -83,13 +108,18 @@ class PackIOMixin:
     def _after_pack_loaded(self, path):
         self.dirty = False
         self.current = -1
-        self._stats = None
-        self._space_est = None
+        had_measurement = bool(_space.MEASURED["snapshot"])
         _space.clear_measured()      # measured for the previous pack
-        self._box_map = None
+        if had_measurement:
+            # Loader-thread counts may have seen the previous pack's disc
+            # measurement; refresh them against the new pack once it is live.
+            self.invalidate_stats()
+        self._box_map = getattr(self, "_loaded_box_map", None)
+        self._loaded_box_map = None
         self.history.clear()          # steps belong to the pack they edited
         self._wb_refs = None
         self._join.clear()
+        self._join_groups_ready = False
         self._join_unit_cache = None
         self._join_skip.clear()
         self._cancel_join()          # a buffered pass would fire into the new pack
@@ -127,7 +157,8 @@ class PackIOMixin:
             v.rebuild_view()
             self._pump_loader()
         if self.view:
-            self.root.after(50, lambda: self._select_view(0))
+            self.root.after(50, lambda: self._select_view(0)
+                            if self.current < 0 else None)
         self.sb2.configure(text="glossary: %d terms" % len(self.glossary))
         self.root.title("%s  -  %s  (%s)"
                         % (APP_TITLE, os.path.basename(path), APP_REVISION))
@@ -143,7 +174,7 @@ class PackIOMixin:
             else:
                 self.lang_cb.set("Auto")
         # `rebuild_view` above only fills the first insert chunk; the rest is
-        # pumped through `after_idle` by `_insert_plan`, whose last chunk
+        # pumped through short timers by `_insert_plan`, whose last chunk
         # calls `_finish_loading`.  An empty view never reaches that chunk,
         # so close the overlay right away.
         if not self.view:

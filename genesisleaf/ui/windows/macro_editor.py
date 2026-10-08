@@ -22,7 +22,9 @@ from tkinter import messagebox, ttk
 from genesisleaf.core.encoding import TOKEN_RE, parse_text
 from genesisleaf.core.legend import TOKEN_DOCS
 from genesisleaf.ui import theme as _theme
-from genesisleaf.ui.canvas_render import render_text_to_canvas
+from genesisleaf.ui.canvas_render import (
+    render_text_to_canvas, reposition_canvas_preview,
+)
 from genesisleaf.ui.fonts import FONT_MONO, FONT_UI, FONT_UI_B, FONT_UI_SM
 
 # (Tk prefix, label) - the combinations a macro may use
@@ -231,7 +233,8 @@ class MacroEditor:
         self.cv = tk.Canvas(f, height=70, highlightthickness=0,
                             background=_theme.BG_EDIT)
         self.cv.grid(row=6, column=1, columnspan=2, sticky="ew", pady=(10, 0))
-        self.cv.bind("<Configure>", lambda e: self._draw())
+        self.cv.bind("<Configure>", lambda e: (
+            reposition_canvas_preview(self.cv) or self._draw()))
 
         act = ttk.Frame(f)
         act.grid(row=7, column=1, columnspan=2, sticky="w", pady=(12, 0))

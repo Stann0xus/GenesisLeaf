@@ -25,7 +25,8 @@ class ClipboardMixin:
         iid = self.cellsel.last_row() or rows[-1]
         self._select_lock = True
         try:
-            self.tree.selection_set(rows)
+            if tuple(self.tree.selection()) != tuple(rows):
+                self.tree.selection_set(rows)
             self.tree.focus(iid)
             self.tree.see(iid)
         finally:

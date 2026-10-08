@@ -55,8 +55,13 @@ class FreeSpaceMixin:
         snap = _space.MEASURED["snapshot"]
         if not snap or self.pack is None:
             return True
-        return any(snap.get(e.get("key", "")) != e.get("translation", "")
-                   for _s, e in self.pack.flat)
+        key = (id(self.pack), id(snap), getattr(self, "_stats_gen", 0))
+        if getattr(self, "_space_stale_key", None) != key:
+            self._space_stale_key = key
+            self._space_stale_value = any(
+                snap.get(e.get("key", "")) != e.get("translation", "")
+                for _s, e in self.pack.flat)
+        return self._space_stale_value
 
     def accent_mode_for_patcher(self):
         """The `--accents` value a build/dry run uses: the patcher config's
@@ -268,6 +273,8 @@ class FreeSpaceMixin:
 
     def space_changed(self):
         """Drop cached figures and repaint everything that reads them."""
+        self._stats_gen = getattr(self, "_stats_gen", 0) + 1
+        self._space_stale_key = None
         self._space_est = None
         self._stats = None
         self.update_status()

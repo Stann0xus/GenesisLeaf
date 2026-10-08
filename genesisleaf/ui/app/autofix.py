@@ -169,6 +169,7 @@ class AutofixMixin:
             _, e0 = self.pack.flat[self.current]
             self.tr_txt.delete("1.0", "end")
             self.tr_txt.insert("1.0", e0.get("translation", ""))
+            self.tr_txt._tag_content = None
             self.tr_txt.edit_modified(False)
             self.retag(self.tr_txt, allow_over=True)
             self.update_preview()

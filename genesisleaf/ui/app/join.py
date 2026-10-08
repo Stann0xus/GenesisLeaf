@@ -61,7 +61,7 @@ class JoinMixin:
         did) let one line of a box clone into a different box and leave the
         rest of that box's lines behind, which is exactly the case where the
         duplicate is not a duplicate."""
-        if self._join:
+        if getattr(self, "_join_groups_ready", False):
             return self._join
         g = {}
         for u in self._join_units():
@@ -70,6 +70,7 @@ class JoinMixin:
                 continue
             g.setdefault(sig, []).append(u)
         self._join = {sig: us for sig, us in g.items() if len(us) > 1}
+        self._join_groups_ready = True
         return self._join
 
     def _update_join_label(self):

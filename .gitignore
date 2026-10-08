@@ -4,6 +4,13 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# Disc images and staging material - never versioned
+_STAGING/
+*.bin
+*.cue
+*.iso
+*.ppf
+
 # Working packs carry the game script - share only stripped packs
 extraction_samples/
 *.bak
@@ -11,9 +18,17 @@ extraction_samples/
 
 # Local settings / sidecars written by the program
 GenesisLeaf.json
+GenesisText.json
+legaia_patcher_config.json
 *.dict.json
 *.notes.json
 output/
 
+# Local assistant/tool state
+.claude/
+
 # Parsed-pack cache (pickles of opened packs, rebuilt on demand)
 .cache/
+
+# Diagnostic logs written by --debug
+logs/

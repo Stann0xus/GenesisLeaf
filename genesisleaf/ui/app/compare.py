@@ -7,6 +7,8 @@ import bisect
 import difflib
 import os
 import threading
+from time import perf_counter
+from contextlib import nullcontext
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -19,10 +21,14 @@ from genesisleaf.core.dialog import default_limit_context, limit_for
 from genesisleaf.core.encoding import parse_text
 from genesisleaf.core.pack import Pack, needs_accent_font
 from genesisleaf.core import pairing
+from genesisleaf.diagnostics import current as current_diagnostics
 from genesisleaf.ui.cellsel import CellSelection, clean
-from genesisleaf.ui.canvas_render import render_text_to_canvas
+from genesisleaf.ui.canvas_render import (
+    reposition_canvas_preview,
+)
 from genesisleaf.ui.fonts import FONT_MONO, FONT_MONO_B, FONT_UI_SM, FONT_UI_SM_B
 from genesisleaf.ui.loader import BusyOverlay
+from genesisleaf.ui.virtual_tree import VirtualTreeview
 from genesisleaf.ui.menubar import Menubar
 from genesisleaf.ui.widgets import ToolTip, TreeRowTip
 from genesisleaf.ui import theme as _theme
@@ -66,6 +72,8 @@ class CompareMixin:
         self._cmp_busy = False
         self._cmp_overlay = None
         self._cmp_detail_job = None
+        self._cmp_resize_job = None
+        self.cmp_pv_scale = 2
         self._cmp_diff_pos = []
         self._cmp_other_flat = []
         self._build_compare_menu(parent.winfo_toplevel())
@@ -124,22 +132,31 @@ class CompareMixin:
         self.cmp_cb.pack(side="left", padx=(2, 8))
         self.cmp_cb.bind("<<ComboboxSelected>>",
                          lambda e: self._cmp_apply_filter())
+        self.cmp_follow_main = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mid, text="Link editor selection",
+                        variable=self.cmp_follow_main,
+                        command=self._cmp_follow_main).pack(side="left", padx=6)
         self.l_cmp_pos = ttk.Label(mid, text="", font=FONT_UI_SM,
                                    foreground=_theme.TH_FG_MUTED)
         self.l_cmp_pos.pack(side="left", padx=(4, 0))
         self.l_cmp_sum = ttk.Label(mid, text="", foreground=_theme.TH_FG_MUTED,
                                    font=FONT_UI_SM)
         self.l_cmp_sum.pack(side="right")
+        self.cmp_table_visible = tk.BooleanVar(value=True)
+        ttk.Checkbutton(mid, text="Show table", variable=self.cmp_table_visible,
+                        command=self._cmp_toggle_table).pack(side="right", padx=(6, 2))
 
         # ---- table over the lower section, the split draggable ------------
         vpan = ttk.Panedwindow(f, orient="vertical")
         vpan.pack(fill="both", expand=True, pady=(6, 0))
         self._cmp_vpan = vpan
+        self._cmp_tree_row = None
         self._cmp_sash_set = False
         vpan.bind("<Configure>", self._cmp_first_sash, add="+")
 
         # ---- the two panes ---------------------------------------------------
         tree_row = ttk.Frame(vpan)
+        self._cmp_tree_row = tree_row
         vpan.add(tree_row, weight=3)
         tree_row.rowconfigure(0, weight=1)
         tree_row.columnconfigure(1, weight=1)
@@ -148,7 +165,7 @@ class CompareMixin:
                                  bg=_theme.TH_TREE_BG,
                                  highlightbackground=_theme.TH_BORDER)
         self.cmp_loc.grid(row=0, column=0, sticky="ns", padx=(0, 4))
-        self.cmp_loc.bind("<Configure>", lambda e: self._cmp_draw_location())
+        self.cmp_loc.bind("<Configure>", self._cmp_schedule_location)
         self.cmp_loc.bind("<Button-1>", self._cmp_loc_click)
         self.cmp_loc.bind("<B1-Motion>", self._cmp_loc_click)
 
@@ -170,7 +187,7 @@ class CompareMixin:
             self.cmp_tree, on_pick=self._cmp_on_cells_picked,
             on_copy=self._push_clip_history)
         self.cmp_cellsel_r = CellSelection(
-            self.cmp_tree_r, on_pick=self._cmp_on_cells_picked,
+            self.cmp_tree_r, on_pick=lambda rows: self._cmp_on_cells_picked(rows, "right"),
             on_copy=self._push_clip_history)
         self._cmp_apply_tags()
 
@@ -192,23 +209,36 @@ class CompareMixin:
                                      "Alt+double-click: notes.  Drag the "
                                      "split above to resize.",
                          foreground=_theme.TH_FG_FAINT, font=FONT_UI_SM)
+        self._cmp_hint = hint
         hint.pack(side="bottom", fill="x", pady=(4, 0))
 
         ctrl_row = ttk.Frame(lower)
+        self._cmp_controls = ctrl_row
         ctrl_row.pack(side="top", fill="x", pady=(6, 2))
+        ttk.Label(ctrl_row, text="Preview scale", font=FONT_UI_SM,
+                  foreground=_theme.TH_FG_MUTED).pack(side="left", padx=(0, 4))
+        ttk.Button(ctrl_row, text="-", width=2,
+                   command=lambda: self._cmp_scale_by(-1)).pack(side="left")
+        self.l_cmp_scale = ttk.Label(ctrl_row, text="2x", width=3,
+                                     font=FONT_UI_SM)
+        self.l_cmp_scale.pack(side="left")
+        ttk.Button(ctrl_row, text="+", width=2,
+                   command=lambda: self._cmp_scale_by(1)).pack(side="left", padx=(0, 8))
         # each side: what to preview (translation / source / both) and with
         # which font; the accent font follows each pack's language
         self.cmp_mine_mode = tk.StringVar(value="translation")
         self.cmp_mine_both = tk.BooleanVar(value=False)
+        self.cmp_mine_inline = tk.BooleanVar(value=False)
         self.cmp_mine_accent = tk.BooleanVar(value=False)
         self.cmp_other_mode = tk.StringVar(value="translation")
         self.cmp_other_both = tk.BooleanVar(value=False)
+        self.cmp_other_inline = tk.BooleanVar(value=False)
         self.cmp_other_accent = tk.BooleanVar(value=False)
-        for side, label, mode, both, accent in (
+        for side, label, mode, both, inline, accent in (
                 ("left", "Current pack preview:", self.cmp_mine_mode,
-                 self.cmp_mine_both, self.cmp_mine_accent),
+                 self.cmp_mine_both, self.cmp_mine_inline, self.cmp_mine_accent),
                 ("right", "Other pack preview:", self.cmp_other_mode,
-                 self.cmp_other_both, self.cmp_other_accent)):
+                 self.cmp_other_both, self.cmp_other_inline, self.cmp_other_accent)):
             grp = ttk.Frame(ctrl_row)
             grp.pack(side=side)
             ttk.Label(grp, text=label, font=FONT_UI_SM,
@@ -223,6 +253,10 @@ class CompareMixin:
             ttk.Checkbutton(grp, text="Both", variable=both,
                             command=self._cmp_rebuild_previews).pack(
                 side="left", padx=(4, 0))
+            inline_cb = ttk.Checkbutton(grp, text="Two lines", variable=inline,
+                                        command=self._cmp_rebuild_previews)
+            inline_cb.pack(side="left", padx=(3, 0))
+            inline._cmp_widget = inline_cb
             ttk.Checkbutton(grp, text="Accent font", variable=accent,
                             command=self._cmp_show_detail).pack(
                 side="left", padx=(8, 0))
@@ -239,6 +273,7 @@ class CompareMixin:
         self._cmp_drow.pack(side="top", fill="both", expand=True)
         self._cmp_pv_canvases = {}
         self._cmp_rebuild_previews()
+        self._cmp_drow.bind("<Configure>", self._cmp_preview_resize, add="+")
 
         self._cmp_bind_keys(parent.winfo_toplevel())
         self._cmp_paint_diff_pane()
@@ -255,7 +290,7 @@ class CompareMixin:
                          anchor="w", padding=(4, 2))
         head.grid(row=0, column=0, sticky="ew")
         cols = self.CMP_LEFT_COLS if side == "left" else self.CMP_RIGHT_COLS
-        tv = ttk.Treeview(host, columns=[c for c, _t, _w in cols],
+        tv = VirtualTreeview(host, columns=[c for c, _t, _w in cols],
                           show="headings", height=10)
         for c, t, w in cols:
             tv.heading(c, text=t)
@@ -276,6 +311,8 @@ class CompareMixin:
         tv.bind("<<TreeviewSelect>>",
                 lambda e, s=side: self._cmp_on_select(s))
         tv.bind("<Control-c>", lambda e, s=side: self._cmp_on_copy_cell(e, s))
+        for key in ("Up", "Down", "Prior", "Next", "Home", "End"):
+            tv.bind("<%s>" % key, self._cmp_rowkey)
         # ahead of the Treeview class's own <Up>/<Down>, which would move
         # the selection one row before the jump
         tv.bind("<Alt-Down>", lambda e: self.cmp_goto_diff(1) or "break")
@@ -368,8 +405,12 @@ class CompareMixin:
         minutes; now the window shows a spinner and stays responsive, and a
         newer request simply supersedes a running one."""
         self._cmp_gen += 1
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("COMPARE_START", file=os.path.basename(path) if path else "refresh",
+                          mine_rows=len(self.pack.flat))
         gen = self._cmp_gen
-        mine_flat = list(self.pack.flat)
+        mine_flat = [(sec, dict(entry)) for sec, entry in self.pack.flat]
         mine_snap = pairing.snapshot(mine_flat)
         other = self.other
         out = {}
@@ -392,13 +433,15 @@ class CompareMixin:
                     return
                 pairs, unused = res
                 rows = []
-                for i, oi, level, ev in pairs:
-                    rows.append(self._cmp_pair_row(
-                        level, ev, (i,) + mine_flat[i],
-                        (oi,) + o_flat[oi] if oi is not None else None))
-                for oi in unused:
-                    rows.append(self._cmp_pair_row(
-                        "none", [], None, (oi,) + o_flat[oi]))
+                with (monitor.span("compare.build_rows", pairs=len(pairs),
+                                   unmatched=len(unused)) if monitor else nullcontext()):
+                    for i, oi, level, ev in pairs:
+                        rows.append(self._cmp_pair_row(
+                            level, ev, (i,) + mine_flat[i],
+                            (oi,) + o_flat[oi] if oi is not None else None))
+                    for oi in unused:
+                        rows.append(self._cmp_pair_row(
+                            "none", [], None, (oi,) + o_flat[oi]))
                 out["rows"] = rows
                 out["oflat"] = o_flat
             except Exception as e:              # noqa: BLE001 - shown to user
@@ -413,16 +456,22 @@ class CompareMixin:
             self.root.after(40, lambda: self._cmp_poll(th, gen, path, out))
             return
         if gen != self._cmp_gen:
+            if "other" in out:
+                out["other"].close()
             return                   # superseded; the newer run finishes up
         self._cmp_busy = False
         self._cmp_hide_overlay()
         if "err" in out:
+            if "other" in out:
+                out["other"].close()
             messagebox.showerror("Compare", str(out["err"]),
                                  parent=self.compare_win)
             return
         if "rows" not in out:
             return
         if path is not None:
+            if self.other is not None:
+                self.other.close()
             self.other = out["other"]
             self.other_path = path
             self.cmp_other_accent.set(needs_accent_font(self.other.header))
@@ -432,6 +481,12 @@ class CompareMixin:
                                  or needs_accent_font(self.pack.header))
         self._cmp_other_flat = out["oflat"]
         self.cmp = out["rows"]
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("COMPARE_READY", rows=len(self.cmp),
+                          other_rows=len(out["oflat"]))
+        self._cmp_rows_by_mine = {r[CMP_MI]: r for r in self.cmp
+                                  if r[CMP_MI] is not None}
         self._cmp_update_labels()
         self._cmp_apply_filter()
 
@@ -451,13 +506,23 @@ class CompareMixin:
         self._cmp_gen += 1            # drop any pairing still running
         self._cmp_busy = False
         self._cmp_hide_overlay()
+        if self.other is not None:
+            self.other.close()
         self.other = None
         self.other_path = None
         self._cmp_clear()
 
     def _cmp_clear(self):
+        job = getattr(self, "_cmp_follow_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+            self._cmp_follow_job = None
         self._cmp_other_flat = []
         self.cmp = []
+        self._cmp_rows_by_mine = {}
         self._cmp_update_labels()
         self._cmp_apply_filter()
 
@@ -698,17 +763,32 @@ class CompareMixin:
         """Show the rows the 'Show:' filter allows (no re-pairing)."""
         self.cmp_cellsel.clear()
         self.cmp_cellsel_r.clear()
-        for t in (self.cmp_tree, self.cmp_tree_r):
-            t.delete(*t.get_children())
+        old_count = len(self.cmp_iid)
         self.cmp_iid = {}
         self.cmp_pos_iid = {}
+        self._cmp_y_range_left = None
+        self._cmp_y_range_right = None
         filt = self.cmp_cb.get() or "All"
         self.cmp_view = [r for r in self.cmp if self._cmp_allowed(r, filt)]
+        self._cmp_build_started = perf_counter()
+        if max(old_count, len(self.cmp_view)) > 2000 and not getattr(
+                self, "_cmp_bulk_hidden", False):
+            self.cmp_tree.grid_remove()
+            self.cmp_tree_r.grid_remove()
+            self._cmp_bulk_hidden = True
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("COMPARE_TABLE_START", rows=len(self.cmp_view),
+                          previous_rows=old_count,
+                          hidden=bool(getattr(self, "_cmp_bulk_hidden", False)))
+        for t in (self.cmp_tree, self.cmp_tree_r):
+            t.delete(*t.get_children())
+        self._cmp_by_mine = {r[CMP_MI]: pos for pos, r in enumerate(self.cmp_view)
+                             if r[CMP_MI] is not None}
         self._cmp_plan = self.cmp_view
         self._cmp_diff_pos = self._cmp_find_diffs()
         self._cmp_ins_gen = getattr(self, "_cmp_ins_gen", 0) + 1
         self.update_cmp_summary()
-        self._cmp_draw_location()
         self._insert_cmp_rows(0, self._cmp_ins_gen)
         self._cmp_show_detail()
 
@@ -747,15 +827,33 @@ class CompareMixin:
         if gen != self._cmp_ins_gen:
             return
         plan = self._cmp_plan
-        CHUNK = 900
-        end = min(k + CHUNK, len(plan))
-        for pos in range(k, end):
-            self._cmp_insert_row(pos)
+        deadline = perf_counter() + 0.008
+        end = k
+        while end < min(k + 512, len(plan)):
+            self._cmp_insert_row(end)
+            end += 1
+            if end % 32 == 0 and perf_counter() >= deadline:
+                break
         if end < len(plan):
-            self.root.after_idle(lambda: self._insert_cmp_rows(end, gen))
+            self.root.after(1, lambda: self._insert_cmp_rows(end, gen))
         else:
+            self._show_cmp_bulk_trees()
+            self.cmp_tree.refresh_scrollbar()
+            self.cmp_tree_r.refresh_scrollbar()
+            monitor = current_diagnostics()
+            if monitor is not None:
+                monitor.event("COMPARE_TABLE_READY", rows=len(self.cmp_iid),
+                              elapsed_ms=round((perf_counter() - self._cmp_build_started)
+                                               * 1000, 3))
             self.update_cmp_summary()
             self._cmp_draw_location()
+            self._cmp_follow_main()
+
+    def _show_cmp_bulk_trees(self):
+        if getattr(self, "_cmp_bulk_hidden", False):
+            self._cmp_bulk_hidden = False
+            self.cmp_tree.grid()
+            self.cmp_tree_r.grid()
 
     def _cmp_insert_row(self, pos):
         row = self.cmp_view[pos]
@@ -789,12 +887,43 @@ class CompareMixin:
         self.cmp_tree.yview(*args)
         self.cmp_tree_r.yview(*args)
 
+    def _cmp_rowkey(self, event):
+        """Walk the full compare order, including detached viewport rows."""
+        tree = event.widget
+        sel = tree.selection()
+        iid = tree.focus() or (sel[0] if sel else None)
+        pos = self.cmp_iid.get(iid, 0)
+        step = max(1, tree._visible_rows() - 1)
+        delta = {"Up": -1, "Down": 1, "Prior": -step, "Next": step}
+        if event.keysym == "Home":
+            pos = 0
+        elif event.keysym == "End":
+            pos = len(self.cmp_view) - 1
+        else:
+            pos += delta.get(event.keysym, 0)
+        pos = max(0, min(pos, len(self.cmp_view) - 1))
+        iid = self.cmp_pos_iid.get(pos)
+        if iid is not None:
+            tree.see(iid)
+            tree.selection_set(iid)
+            tree.focus(iid)
+        return "break"
+
     def _cmp_on_yscroll(self, side, first, last):
         """One pane scrolled (wheel, keys, see()): follow with the other."""
+        if side == "left":
+            self._cmp_y_range_left = (float(first), float(last))
+        else:
+            self._cmp_y_range_right = (float(first), float(last))
         self._cmp_vs.set(first, last)
         other = self.cmp_tree_r if side == "left" else self.cmp_tree
         try:
-            if abs(other.yview()[0] - float(first)) > 1e-9:
+            other_side = "right" if side == "left" else "left"
+            other_range = getattr(self, "_cmp_y_range_" + other_side, None)
+            other_first = other_range[0] if other_range else other.yview()[0]
+            # Tk rounds row fractions independently in the two panes. A
+            # sub-row difference must not bounce yview_moveto back and forth.
+            if abs(other_first - float(first)) > 0.5 / max(1, len(self.cmp_iid)):
                 other.yview_moveto(first)
         except tk.TclError:
             pass
@@ -809,6 +938,23 @@ class CompareMixin:
         foc = src.focus()
         if foc and dst.focus() != foc:
             dst.focus(foc)
+        if getattr(self, "cmp_follow_main", None) is not None and self.cmp_follow_main.get():
+            iid = foc if foc in sel else (sel[0] if sel else None)
+            pos = self.cmp_iid.get(iid)
+            if pos is not None:
+                mi = self.cmp_view[pos][CMP_MI]
+                if mi is not None and mi != self.current:
+                    self._cmp_linking = True
+                    try:
+                        main_iid = self._iid_of(mi)
+                        if main_iid:
+                            self.cellsel.clear()
+                            self._set_tree_selection((main_iid,))
+                            self.tree.focus(main_iid)
+                            self._see_if_needed(main_iid)
+                        self.select_entry(mi)
+                    finally:
+                        self._cmp_linking = False
         self._cmp_update_pos_label()
         # both panes report the same change; draw once
         if self._cmp_detail_job is None:
@@ -817,6 +963,63 @@ class CompareMixin:
     def _cmp_detail_now(self):
         self._cmp_detail_job = None
         self._cmp_show_detail()
+
+    def _cmp_follow_main(self, index=None):
+        """Follow the editor after its selection has settled."""
+        option = getattr(self, "cmp_follow_main", None)
+        if (option is None or not option.get() or getattr(self, "_cmp_busy", False)
+                or getattr(self, "_cmp_linking", False)):
+            return
+        if index is None:
+            index = self.current
+        job = getattr(self, "_cmp_follow_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        # An isolated step updates the compare panes in the same idle pass as
+        # the editor; a burst (held arrow key) is throttled to one update per
+        # 120 ms so the secondary window cannot starve the main one.
+        wait = 120 - (perf_counter() - getattr(self, "_cmp_follow_at", 0.0)) * 1000
+        run = lambda row=index: self._cmp_follow_now(row)
+        self._cmp_follow_job = (self.root.after(int(wait), run) if wait > 0
+                                else self.root.after_idle(run))
+
+    def _cmp_follow_now(self, index):
+        self._cmp_follow_job = None
+        self._cmp_follow_at = perf_counter()
+        if (index != self.current or not self.cmp_follow_main.get()
+                or getattr(self, "_cmp_busy", False)):
+            return
+        pos = getattr(self, "_cmp_by_mine", {}).get(index)
+        iid = self.cmp_pos_iid.get(pos)
+        if iid is None:
+            return                    # filtered out or not inserted yet
+        for side, tree in (("left", self.cmp_tree), ("right", self.cmp_tree_r)):
+            if tuple(tree.selection()) != (iid,):
+                tree.selection_set(iid)
+            if tree.focus() != iid:
+                tree.focus(iid)
+            self._cmp_see_if_needed(side, tree, iid, pos)
+
+    def _cmp_see_if_needed(self, side, tree, iid, pos):
+        bounds = getattr(self, "_cmp_y_range_" + side, None)
+        if bounds is None:
+            bounds = tree.yview()
+        first, last = bounds
+        count = len(self.cmp_iid)
+        if count and first * count <= pos and pos + 1 <= last * count:
+            monitor = current_diagnostics()
+            if monitor is not None:
+                monitor.event("COMPARE_ROW_VISIBILITY", side=side, row=pos,
+                              visible=True)
+            return
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("COMPARE_ROW_VISIBILITY", side=side, row=pos,
+                          visible=False)
+        tree.see(iid)
 
     # -- location bar (WinMerge's location pane) ---------------------------
     def _cmp_loc_marks(self, row):
@@ -842,6 +1045,19 @@ class CompareMixin:
 
     _LOC_RANK = {"srcdiff": 1, "diff": 2, "strong": 3, "mineuf": 4,
                  "weak": 5, "mine": 2, "other": 2}
+
+    def _cmp_schedule_location(self, _evt=None):
+        job = getattr(self, "_cmp_loc_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._cmp_loc_job = self.root.after(60, self._cmp_run_location)
+
+    def _cmp_run_location(self):
+        self._cmp_loc_job = None
+        self._cmp_draw_location()
 
     def _cmp_draw_location(self):
         cv = getattr(self, "cmp_loc", None)
@@ -959,19 +1175,22 @@ class CompareMixin:
         if lab is None:
             return
         if msg:
-            lab.configure(text=msg)
-            return
-        diffs = self._cmp_diff_pos
-        if not self.other:
-            lab.configure(text="")
-            return
-        cur = self._cmp_cur_pos()
-        k = bisect.bisect_left(diffs, cur) if cur is not None else -1
-        if cur is not None and k < len(diffs) and diffs[k] == cur:
-            lab.configure(text="difference %d of %d" % (k + 1, len(diffs)))
+            label = msg
         else:
-            lab.configure(text="%d difference%s in view" % (
-                len(diffs), "" if len(diffs) == 1 else "s"))
+            diffs = self._cmp_diff_pos
+            if not self.other:
+                label = ""
+            else:
+                cur = self._cmp_cur_pos()
+                k = bisect.bisect_left(diffs, cur) if cur is not None else -1
+                if cur is not None and k < len(diffs) and diffs[k] == cur:
+                    label = "difference %d of %d" % (k + 1, len(diffs))
+                else:
+                    label = "%d difference%s in view" % (
+                        len(diffs), "" if len(diffs) == 1 else "s")
+        if getattr(self, "_cmp_pos_label_text", None) != label:
+            self._cmp_pos_label_text = label
+            lab.configure(text=label)
 
     # -- diff pane -----------------------------------------------------------
     def _cmp_paint_diff_pane(self):
@@ -1047,10 +1266,45 @@ class CompareMixin:
         vs = ttk.Scrollbar(host, orient="vertical", command=cv.yview)
         hs = ttk.Scrollbar(host, orient="horizontal", command=cv.xview)
         cv.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        cv.configure(highlightthickness=1, highlightbackground=_theme.TH_BORDER)
         cv.grid(row=0, column=0, sticky="nsew")
         vs.grid(row=0, column=1, sticky="ns")
         hs.grid(row=1, column=0, sticky="ew")
         return f, cv
+
+    def _cmp_toggle_table(self):
+        """Show only previews when the comparison table is disabled."""
+        try:
+            if self.cmp_table_visible.get():
+                self._cmp_vpan.insert(0, self._cmp_tree_row, weight=3)
+                self.cmp_diff.pack(side="top", fill="x", pady=(6, 0),
+                                   before=self._cmp_controls)
+                self._cmp_hint.pack(side="bottom", fill="x", pady=(4, 0))
+            else:
+                self._cmp_vpan.forget(self._cmp_tree_row)
+                self.cmp_diff.pack_forget()
+                self._cmp_hint.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _cmp_scale_by(self, delta):
+        self.cmp_pv_scale = max(1, min(8, self.cmp_pv_scale + delta))
+        self.l_cmp_scale.configure(text="%dx" % self.cmp_pv_scale)
+        self._cmp_show_detail()
+
+    def _cmp_preview_resize(self, _evt=None):
+        """Coalesce resize redraws to the latest frame (at most 60 fps)."""
+        if self._cmp_resize_job is not None:
+            try:
+                self.root.after_cancel(self._cmp_resize_job)
+            except (tk.TclError, ValueError):
+                pass
+        self._cmp_resize_job = self.root.after(16, self._cmp_run_resize)
+
+    def _cmp_run_resize(self):
+        self._cmp_resize_job = None
+        for cv in self._cmp_pv_canvases.values():
+            reposition_canvas_preview(cv)
 
     def _cmp_rebuild_previews(self, _evt=None):
         """Destroy and recreate the canvas panels based on current checkbox state.
@@ -1067,6 +1321,8 @@ class CompareMixin:
         drow = getattr(self, "_cmp_drow", None)
         if drow is None:
             return
+        for cv in getattr(self, "_cmp_pv_canvases", {}).values():
+            self.preview_queue.cancel(cv)
         for w in drow.winfo_children():
             w.destroy()
         self._cmp_pv_canvases = {}
@@ -1079,22 +1335,36 @@ class CompareMixin:
                             tk.BooleanVar(value=False)).get()
         mine_mode = getattr(self, "cmp_mine_mode",
                             tk.StringVar(value="translation")).get()
+        mine_inline = self.cmp_mine_inline.get()
+        other_inline = self.cmp_other_inline.get()
+        for flag, both_flag in ((self.cmp_mine_inline, self.cmp_mine_both),
+                                (self.cmp_other_inline, self.cmp_other_both)):
+            widget = getattr(flag, "_cmp_widget", None)
+            if widget is not None:
+                if both_flag.get(): widget.pack(side="left", padx=(3, 0))
+                else: widget.pack_forget()
 
         slots = []   # (key, label), left to right - same sides as the panes
         if mine_both:
-            slots.append(("mine_src", "Mine — Source"))
-            slots.append(("mine_tr", "Mine — Translation"))
+            if mine_inline:
+                slots.append(("mine_both", "Mine - Source / Translation"))
+            else:
+                slots.extend((("mine_src", "Mine - Source"),
+                              ("mine_tr", "Mine - Translation")))
         elif mine_mode == "source":
-            slots.append(("mine_src", "Mine — Source"))
+            slots.append(("mine_src", "Mine - Source"))
         else:
-            slots.append(("mine_tr", "Mine — Translation"))
+            slots.append(("mine_tr", "Mine - Translation"))
         if other_both:
-            slots.append(("other_src", "Other — Source"))
-            slots.append(("other_tr", "Other — Translation"))
+            if other_inline:
+                slots.append(("other_both", "Other - Source / Translation"))
+            else:
+                slots.extend((("other_src", "Other - Source"),
+                              ("other_tr", "Other - Translation")))
         elif mode == "source":
-            slots.append(("other_src", "Other — Source"))
+            slots.append(("other_src", "Other - Source"))
         else:
-            slots.append(("other_tr", "Other — Translation"))
+            slots.append(("other_tr", "Other - Translation"))
 
         for key, label in slots:
             fr, cv = self._make_cmp_canvas(drow, label)
@@ -1110,18 +1380,19 @@ class CompareMixin:
         """Render the selected compare row(s) into the diff pane and every
         active preview canvas.  Never touches the editor's own preview."""
         canvases = getattr(self, "_cmp_pv_canvases", {})
-        for cv in canvases.values():
-            try:
-                cv.delete("all")
-            except tk.TclError:
-                pass
         rows, positions = self._cmp_preview_rows()
-        if getattr(self, "cmp_diff", None) is not None:
+        if (getattr(self, "cmp_diff", None) is not None
+                and self.cmp_table_visible.get()):
             cur = self._cmp_cur_pos()
             focus = (self.cmp_view[cur] if cur is not None
                      and cur < len(self.cmp_view) else None)
             self._cmp_fill_diff_pane(focus or (rows[0] if rows else None))
-        if not canvases or not rows:
+        if not canvases:
+            return
+        group = object()
+        if not rows:
+            for cv in canvases.values():
+                self.preview_queue.request_blank(cv, group=group)
             return
         row = rows[0]
         ctx = default_limit_context(row[CMP_SEC])
@@ -1130,7 +1401,6 @@ class CompareMixin:
         if lim:
             meta["limit"] = lim["context"]
             meta["glyph_pad"] = lim["glyph_pad"]
-        jp = self.jp_font(2)
         # each side in its own pack's font: the accent font where that
         # pack's language needs it (set on load, switchable per side)
         accent = {"mine": self.cmp_mine_accent.get(),
@@ -1140,17 +1410,28 @@ class CompareMixin:
         fields = {"other_tr": CMP_OTR, "other_src": CMP_OSRC,
                   "mine_tr": CMP_MTR, "mine_src": CMP_SRC}
         for key, cv in canvases.items():
-            f = fields[key]
-            texts = [r[f] if len(r) > f else "" for r in rows]
+            panel_positions = positions
+            if key.endswith("_both"):
+                src_f, tr_f = ((CMP_SRC, CMP_MTR) if key.startswith("mine")
+                               else (CMP_OSRC, CMP_OTR))
+                texts = []
+                for r in rows:
+                    texts.extend((r[src_f] if len(r) > src_f else "",
+                                  r[tr_f] if len(r) > tr_f else ""))
+                panel_positions = None
+            else:
+                f = fields[key]
+                texts = [r[f] if len(r) > f else "" for r in rows]
             if not any(texts):
+                self.preview_queue.request_blank(cv, group=group)
                 continue
             try:
-                render_text_to_canvas(
+                self.preview_queue.request(
                     cv, texts, meta, expander=expander,
-                    scale=2, row_positions=positions,
+                    scale=self.cmp_pv_scale, row_positions=panel_positions,
                     accent_font=accent[key.split("_")[0]],
-                    fallback_font=jp,
-                    rf_config=getattr(self, "rf_config", None))
+                    fallback_font=self.jp_font(self.cmp_pv_scale),
+                    rf_config=getattr(self, "rf_config", None), group=group)
             except Exception:
                 pass
         # the canvases take the height the split gives them; a taller box
@@ -1179,7 +1460,7 @@ class CompareMixin:
         if tree is None:
             return [], None
         picked = []
-        for iid in sorted(tree.selection(), key=tree.index):
+        for iid in sorted(tree.selection(), key=lambda iid: self.cmp_iid.get(iid, -1)):
             pos = self.cmp_iid.get(iid)
             if pos is not None and pos < len(self.cmp_view):
                 picked.append(self.cmp_view[pos])
@@ -1188,8 +1469,10 @@ class CompareMixin:
         multi = getattr(self, "multi_var", None)
         if multi is None or not multi.get() or self.pack is None:
             return picked[:self.CMP_PV_MAX_ROWS], None
-        by_mine = {r[CMP_MI]: r for r in getattr(self, "cmp", [])
-                   if r[CMP_MI] is not None}
+        if not hasattr(self, "_cmp_rows_by_mine"):
+            self._cmp_rows_by_mine = {r[CMP_MI]: r for r in getattr(self, "cmp", [])
+                                      if r[CMP_MI] is not None}
+        by_mine = self._cmp_rows_by_mine
         bmap = self.box_map()
         out, seen, positions = [], set(), []
         for r in picked:
@@ -1212,14 +1495,16 @@ class CompareMixin:
 
     # ---- comparator cell-column copy helpers --------------------------------
 
-    def _cmp_on_cells_picked(self, rows):
+    def _cmp_on_cells_picked(self, rows, side="left"):
         """Ctrl+Clicked cells select their rows (which shows the active
         pair in the diff pane through <<TreeviewSelect>>)."""
-        iid = (self.cmp_cellsel.last_row() or self.cmp_cellsel_r.last_row()
-               or rows[-1])
-        self.cmp_tree.selection_set(rows)
-        self.cmp_tree.focus(iid)
-        self.cmp_tree.see(iid)
+        picker = self.cmp_cellsel if side == "left" else self.cmp_cellsel_r
+        tree = self.cmp_tree if side == "left" else self.cmp_tree_r
+        iid = picker.last_row() or rows[-1]
+        if tuple(tree.selection()) != tuple(rows):
+            tree.selection_set(rows)
+        tree.focus(iid)
+        tree.see(iid)
 
     def _cmp_on_copy_cell(self, _evt=None, side="left"):
         """Ctrl+C on a pane: its Ctrl+Clicked cells when there are any,

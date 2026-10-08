@@ -24,12 +24,12 @@ import importlib
 import tkinter as tk
 
 from genesisleaf.compat import _PILImage, _PILImageTk
-from genesisleaf.core.colors import hex_to_rgb, mix
+from genesisleaf.core.colors import darken, hex_to_rgb, mix
 
 THEME = "legaia"        # the ttk theme this module builds
 CLASSIC = "clam"        # the stock theme the classic UI runs on
 
-_state = {"installed": None, "images": []}
+_state = {"installed": None, "images": [], "sources": [], "tk": None, "palette": "uninitialized"}
 
 
 def available():
@@ -106,6 +106,37 @@ def three_slice(prefix):
     return img
 
 
+# ttk draws an image element's 9-slice by tiling the centre/edge slices across
+# the widget, one Tk_RedrawImage per tile.  A 24px well leaves a 16px tile, so a
+# full-size Treeview needed ~1,000 blits (about 160 ms) on *every* repaint, and
+# each column heading another ~40.  The slices are repeated into a larger image
+# here - identical pixels, same tile phase - so the same area takes a few blits.
+# Callers pin the element's natural size with width/height (see `_natural`).
+_TILE_SPAN = 512
+
+
+def expand_slices(img, border, span=_TILE_SPAN):
+    """`img` with its 9-slice centre rows/columns repeated out to ~`span` px."""
+    w, h = img.size
+    mw, mh = w - 2 * border, h - 2 * border
+    if mw <= 0 or mh <= 0:
+        return img
+    kx, ky = max(1, span // mw), max(1, span // mh)
+    wide = _PILImage.new("RGBA", (2 * border + mw * kx, h))
+    wide.paste(img.crop((0, 0, border, h)), (0, 0))
+    strip = img.crop((border, 0, w - border, h))
+    for i in range(kx):
+        wide.paste(strip, (border + i * mw, 0))
+    wide.paste(img.crop((w - border, 0, w, h)), (border + mw * kx, 0))
+    out = _PILImage.new("RGBA", (wide.width, 2 * border + mh * ky))
+    out.paste(wide.crop((0, 0, wide.width, border)), (0, 0))
+    strip = wide.crop((0, border, wide.width, h - border))
+    for i in range(ky):
+        out.paste(strip, (0, border + i * mh))
+    out.paste(wide.crop((0, h - border, wide.width, h)), (0, border + mh * ky))
+    return out
+
+
 def shade(img, brightness=1.0, saturation=1.0):
     """`img` with its colour scaled; alpha is kept."""
     from PIL import ImageEnhance
@@ -179,16 +210,53 @@ def _checkbox(size, fill, outline, hi, lo, tick=None):
 
 
 # -- the theme ---------------------------------------------------------------
-def _photo(root, img):
+def _photo(root, img, role="window"):
+    """A PhotoImage of `img`; `role` picks which theme colours tint it."""
+    from genesisleaf.ui import theme
+    source = img.copy()
+    if theme.MENU_UI and theme.CLASSIC_THEME != "Default":
+        img = tint_image(source, theme.current_values(), role)
     photo = _PILImageTk.PhotoImage(img, master=root)
     _state["images"].append(photo)          # Tk drops images nobody holds
+    _state["sources"].append((source, role))
     return photo
+
+
+def _ramp(base, spread=0.45):
+    return darken(base, spread), base, mix(base, "#ffffff", spread)
+
+
+# (black, mid, white) of the tint per sprite role: frames take the border
+# colour, buttons the button colour, headings/tabs the heading colour,
+# scrollbar thumbs the scrollbar colour - so no two parts share one tint.
+_ROLES = {
+    "window": lambda v: (v["TH_FRAME_BG"], v["TH_BORDER"], mix(v["TH_BORDER"], "#ffffff", 0.5)),
+    "field": lambda v: (v["TH_FIELD_BG"], v["TH_BORDER"], mix(v["TH_BORDER"], "#ffffff", 0.5)),
+    "tree": lambda v: (v["TH_TREE_BG"], v["TH_BORDER"], mix(v["TH_BORDER"], "#ffffff", 0.5)),
+    "plate": lambda v: _ramp(v["TH_BTN_BG"]),
+    "head": lambda v: _ramp(v["TH_HEAD_BG"], 0.3),
+    "scroll": lambda v: _ramp(v["TH_SCROLL"]),
+    "accent": lambda v: _ramp(v["TH_ACCENT"], 0.5),
+    "check": lambda v: (v["TH_FIELD_BG"], v["TH_BORDER"], mix(v["TH_ACCENT"], "#ffffff", 0.3)),
+}
+
+
+def tint_image(img, values, role="window"):
+    """Colour the sprite's luminance ramp, keeping its pixel art and alpha."""
+    from PIL import ImageOps
+    black, mid, white = _ROLES[role](values)
+    tinted = ImageOps.colorize(ImageOps.grayscale(img), black, white,
+                               mid=mid).convert("RGBA")
+    tinted.putalpha(img.getchannel("A"))
+    return tinted
 
 
 def install(root, style):
     """Build the `legaia` ttk theme once; True when the skin is usable.
 
     The active theme is left as it was found."""
+    if _state["tk"] is not root.tk:
+        _state.update(installed=None, images=[], sources=[], tk=root.tk, palette="uninitialized")
     if _state["installed"] is not None:
         return _state["installed"]
     if not available():
@@ -210,6 +278,14 @@ def use(style, skinned):
     target = THEME if skinned and _state["installed"] else CLASSIC
     try:
         style.theme_use(target)
+        if target == THEME:
+            from genesisleaf.ui import theme
+            values = theme.current_values() if theme.CLASSIC_THEME != "Default" else None
+            signature = tuple(sorted(values.items())) if values else None
+            if signature != _state["palette"]:
+                for photo, (source, role) in zip(_state["images"], _state["sources"]):
+                    photo.paste(tint_image(source, values, role) if values else source)
+                _state["palette"] = signature
     except tk.TclError:
         return False
     return target == THEME
@@ -222,107 +298,111 @@ def _build(root, style):
     chrome_bg = pal["TH_CHROME_BG"]
     tiles = _frame_tiles()
 
-    def ph(img):
-        return _photo(root, img)
+    def ph(img, role="window"):
+        return _photo(root, img, role)
 
     style.theme_create(THEME, parent=CLASSIC)
     style.theme_use(THEME)
 
     # frames ---------------------------------------------------------------
-    window = ph(panel(24, 24, frame_bg, tiles))
-    well = ph(panel(24, 24, field_bg, tiles))
-    well_focus = ph(shade(panel(24, 24, field_bg, tiles), 1.18))
-    well_off = ph(shade(panel(24, 24, mix(field_bg, frame_bg, 0.5), tiles),
-                        0.8, 0.6))
+    def big(img, border, role="window"):
+        return ph(expand_slices(img, border), role)
+
+    window = big(panel(24, 24, frame_bg, tiles), 4)
+    well = big(panel(24, 24, field_bg, tiles), 4, "field")
+    well_focus = big(shade(panel(24, 24, field_bg, tiles), 1.18), 4, "field")
+    well_off = big(shade(panel(24, 24, mix(field_bg, frame_bg, 0.5), tiles),
+                         0.8, 0.6), 4, "field")
+    tree_well = big(panel(24, 24, field_bg, tiles), 4, "tree")
     style.element_create("Legaia.panel", "image", window,
                          border=(4, 4, 4, 4), padding=(4, 4, 4, 4),
-                         sticky="nswe")
+                         sticky="nswe", width=24, height=24)
     style.element_create("Legaia.field", "image", well,
                          ("disabled", well_off), ("focus", well_focus),
                          border=(4, 4, 4, 4), padding=(4, 3, 4, 3),
-                         sticky="nswe")
-    style.element_create("Legaia.tree", "image", well,
+                         sticky="nswe", width=24, height=24)
+    style.element_create("Legaia.tree", "image", tree_well,
                          border=(4, 4, 4, 4), padding=(3, 3, 3, 3),
-                         sticky="nswe")
+                         sticky="nswe", width=24, height=24)
 
     # plates (buttons) and plaques (tabs, headings, frame titles) --------------
     blue = three_slice("plate")
     gold = three_slice("tab")
     plate = {
-        "n": ph(blue), "hot": ph(shade(blue, 1.3)), "down": ph(shade(gold, 1.25)),
-        "off": ph(shade(blue, 0.7, 0.35)),
+        "n": big(blue, 8, "plate"), "hot": big(shade(blue, 1.3), 8, "plate"),
+        "down": big(shade(gold, 1.25), 8, "plate"),
+        "off": big(shade(blue, 0.7, 0.35), 8, "plate"),
+    }
+    head = {
+        "n": big(blue, 8, "head"), "hot": big(shade(blue, 1.3), 8, "head"),
+        "down": big(shade(gold, 1.25), 8, "head"),
     }
     style.element_create(
         "Legaia.plate", "image", plate["n"],
         ("disabled", plate["off"]), ("pressed", plate["down"]),
         ("active", plate["hot"]), border=(8, 8, 8, 8), padding=(0, 0, 0, 0),
-        sticky="nswe")
-    plaque = {"n": ph(gold), "hot": ph(shade(gold, 1.3)),
-              "sel": ph(shade(gold, 1.45, 1.1)),
-              "off": ph(shade(blue, 0.65, 0.5))}
+        sticky="nswe", width=32, height=20)
+    plaque = {"n": big(gold, 8, "head"), "hot": big(shade(gold, 1.3), 8, "head"),
+              "sel": big(shade(gold, 1.45, 1.1), 8, "head"),
+              "off": big(shade(blue, 0.65, 0.5), 8, "head")}
     style.element_create(
         "Legaia.plaque", "image", plaque["n"], border=(8, 8, 8, 8),
-        sticky="nswe")
+        sticky="nswe", width=32, height=20)
     style.element_create(
         "Legaia.tab", "image", plaque["off"],
         ("selected", plaque["sel"]), ("active", plaque["hot"]),
-        border=(8, 8, 8, 8), sticky="nswe")
+        border=(8, 8, 8, 8), sticky="nswe", width=32, height=20)
     style.element_create(          # the menu bar's tab plaques
         "Legaia.menutab", "image", plaque["n"],
         ("pressed", plaque["sel"]), ("active", plaque["hot"]),
-        border=(8, 8, 8, 8), sticky="nswe")
+        border=(8, 8, 8, 8), sticky="nswe", width=32, height=20)
     style.element_create(
-        "Legaia.heading", "image", plate["n"],
-        ("pressed", plate["down"]), ("active", plate["hot"]),
-        border=(8, 8, 8, 8), padding=(0, 0, 0, 0), sticky="nswe")
+        "Legaia.heading", "image", head["n"],
+        ("pressed", head["down"]), ("active", head["hot"]),
+        border=(8, 8, 8, 8), padding=(0, 0, 0, 0), sticky="nswe",
+        width=32, height=20)
 
-    # arrows -----------------------------------------------------------------
-    for d in ("up", "down", "left", "right"):
-        arrow = _arrow(d)
-        hot = shade(arrow, 1.25)
-        down = shade(arrow, 0.7)
-        style.element_create("Legaia.arrow_" + d, "image", ph(arrow),
-                             ("pressed", ph(down)), ("active", ph(hot)),
-                             sticky="")
+    # combobox drop and spinbox arrows ---------------------------------------
     drop = _chip(18, 22, chrome_bg, tiles)
     drop_arrow = _arrow("down", 12)
     face = drop.copy()
     face.alpha_composite(drop_arrow, (3, 5))
     style.element_create(
-        "Legaia.drop", "image", ph(face),
-        ("pressed", ph(shade(face, 0.75))), ("active", ph(shade(face, 1.3))),
+        "Legaia.drop", "image", ph(face, "plate"),
+        ("pressed", ph(shade(face, 0.75), "plate")),
+        ("active", ph(shade(face, 1.3), "plate")),
         border=(4, 4, 4, 4), sticky="ns")
     for d, y in (("up", "Legaia.spin_up"), ("down", "Legaia.spin_down")):
         small = _PILImage.new("RGBA", (14, 10), (0, 0, 0, 0))
         small.alpha_composite(_arrow(d, 10), (2, 0))
-        style.element_create(y, "image", ph(small),
-                             ("active", ph(shade(small, 1.3))), sticky="")
+        style.element_create(y, "image", ph(small, "accent"),
+                             ("active", ph(shade(small, 1.3), "accent")), sticky="")
 
     # scrollbars -------------------------------------------------------------
     thumb = panel(16, 16, "#846342", tiles)
-    style.element_create("Legaia.thumb", "image", ph(thumb),
-                         ("active", ph(shade(thumb, 1.25))),
+    style.element_create("Legaia.thumb", "image", ph(thumb, "scroll"),
+                         ("active", ph(shade(thumb, 1.25), "scroll")),
                          border=(4, 4, 4, 4), sticky="nswe")
 
     # check / radio indicators ----------------------------------------------
     outline, tan, bronze = "#422908", "#cea584", "#846342"
     gold_hi = "#f2cb6b"
-    box = ph(_checkbox(14, field_bg, outline, tan, bronze))
-    box_on = ph(_checkbox(14, field_bg, outline, tan, bronze, tick=gold_hi))
-    box_hot = ph(_checkbox(14, "#16227a", outline, tan, bronze))
-    box_hot_on = ph(_checkbox(14, "#16227a", outline, tan, bronze, tick=gold_hi))
-    box_off = ph(shade(_checkbox(14, field_bg, outline, tan, bronze), 0.6, 0.5))
+    box = ph(_checkbox(14, field_bg, outline, tan, bronze), "check")
+    box_on = ph(_checkbox(14, field_bg, outline, tan, bronze, tick=gold_hi), "check")
+    box_hot = ph(_checkbox(14, "#16227a", outline, tan, bronze), "check")
+    box_hot_on = ph(_checkbox(14, "#16227a", outline, tan, bronze, tick=gold_hi), "check")
+    box_off = ph(shade(_checkbox(14, field_bg, outline, tan, bronze), 0.6, 0.5), "check")
     box_off_on = ph(shade(_checkbox(14, field_bg, outline, tan, bronze,
-                                    tick=gold_hi), 0.6, 0.5))
+                                    tick=gold_hi), 0.6, 0.5), "check")
     style.element_create(
         "Legaia.check", "image", box,
         ("disabled", "selected", box_off_on), ("disabled", box_off),
         ("active", "selected", box_hot_on), ("active", box_hot),
         ("selected", box_on), sticky="")
-    gem = ph(_octagon(14, outline, field_bg, tan, bronze))
-    gem_on = ph(_octagon(14, outline, field_bg, tan, bronze, dot=gold_hi))
-    gem_hot = ph(_octagon(14, outline, "#16227a", tan, bronze))
-    gem_hot_on = ph(_octagon(14, outline, "#16227a", tan, bronze, dot=gold_hi))
+    gem = ph(_octagon(14, outline, field_bg, tan, bronze), "check")
+    gem_on = ph(_octagon(14, outline, field_bg, tan, bronze, dot=gold_hi), "check")
+    gem_hot = ph(_octagon(14, outline, "#16227a", tan, bronze), "check")
+    gem_hot_on = ph(_octagon(14, outline, "#16227a", tan, bronze, dot=gold_hi), "check")
     style.element_create(
         "Legaia.radio", "image", gem,
         ("active", "selected", gem_hot_on), ("active", gem_hot),
@@ -379,13 +459,9 @@ def _build(root, style):
             ("Radiobutton.label", {"sticky": "nswe"})]})]})])
     L("Vertical.TScrollbar", [
         ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
-            ("Legaia.arrow_up", {"side": "top", "sticky": ""}),
-            ("Legaia.arrow_down", {"side": "bottom", "sticky": ""}),
             ("Legaia.thumb", {"sticky": "nswe"})]})])
     L("Horizontal.TScrollbar", [
         ("Horizontal.Scrollbar.trough", {"sticky": "we", "children": [
-            ("Legaia.arrow_left", {"side": "left", "sticky": ""}),
-            ("Legaia.arrow_right", {"side": "right", "sticky": ""}),
             ("Legaia.thumb", {"sticky": "nswe"})]})])
     L("Horizontal.TProgressbar", [("Legaia.field", {"sticky": "nswe", "children": [
         ("Horizontal.Progressbar.pbar", {"side": "left", "sticky": "ns"})]})])
@@ -398,8 +474,8 @@ def _build(root, style):
     style.configure("TNotebook.Tab", padding=(6, 3))
     style.configure("TButton", padding=(6, 2), anchor="center")
     style.configure("Treeview.Heading", padding=(2, 2))
-    style.configure("Vertical.TScrollbar", arrowsize=16, width=16)
-    style.configure("Horizontal.TScrollbar", arrowsize=16, width=16)
+    style.configure("Vertical.TScrollbar", width=16)
+    style.configure("Horizontal.TScrollbar", width=16)
 
 
 # -- the hand cursor ----------------------------------------------------------
@@ -414,13 +490,15 @@ class HandCursor:
         self.tree = tree
         self.is_active = is_active
         self._hand = self._blank = None
+        self._selected = set()
+        self._active = None
         tree.bind("<<TreeviewSelect>>", self.refresh, add="+")
 
     def _images(self):
         if self._hand is None:
             img = _sprite("hand")
-            self._hand = _photo(self.tree, img)
-            self._blank = _photo(self.tree, _PILImage.new("RGBA", img.size))
+            self._hand = _photo(self.tree, img, "accent")
+            self._blank = _photo(self.tree, _PILImage.new("RGBA", img.size), "accent")
         return self._hand, self._blank
 
     def refresh(self, _evt=None):
@@ -429,9 +507,15 @@ class HandCursor:
             active = self.is_active()
             hand, blank = self._images() if active else ("", "")
             sel = set(tree.selection())
-            for iid in tree.get_children(""):
+            rows = (tree.get_children("") if _evt is None or active != self._active
+                    else self._selected ^ sel)
+            for iid in rows:
+                if not tree.exists(iid):
+                    continue
                 want = (hand if iid in sel else blank) if active else ""
                 if str(tree.item(iid, "image") or "") != str(want or ""):
                     tree.item(iid, image=want)
+            self._selected = sel
+            self._active = active
         except tk.TclError:
             pass

@@ -8,7 +8,7 @@ import tkinter.font as tkfont
 from tkinter import ttk
 
 from genesisleaf.core.dialog import limit_for
-from genesisleaf.ui.canvas_render import render_text_to_canvas
+from genesisleaf.ui.canvas_render import reposition_canvas_preview
 from genesisleaf.ui.fonts import FONT_UI_SM, JP_FONT_CANDIDATES
 from genesisleaf.ui import theme as _theme
 
@@ -49,6 +49,7 @@ class FloatPreviewMixin:
         vs = ttk.Scrollbar(host, orient="vertical", command=cv.yview)
         hs = ttk.Scrollbar(host, orient="horizontal", command=cv.xview)
         cv.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        cv.bind("<Configure>", lambda _e: reposition_canvas_preview(cv))
         cv.grid(row=0, column=0, sticky="nsew")
         vs.grid(row=0, column=1, sticky="ns")
         hs.grid(row=1, column=0, sticky="ew")
@@ -60,7 +61,11 @@ class FloatPreviewMixin:
         win.geometry("900x760")
         win.transient(self.root)
         win.minsize(420, 320)
-        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+        def hide():
+            self.preview_queue.cancel(self.pv_fcv_src)
+            self.preview_queue.cancel(self.pv_fcv_tr)
+            win.withdraw()
+        win.protocol("WM_DELETE_WINDOW", hide)
         self.pv_fwin = win
         self.pv_fscale = getattr(self, "pv_fscale", 2)
 
@@ -138,7 +143,11 @@ class FloatPreviewMixin:
             return
         if not (src.winfo_exists() and tr.winfo_exists()):
             return
+        if self.pv_fwin.state() != "normal":
+            return
         if self.pack is None or self.current < 0:
+            self.preview_queue.cancel(src)
+            self.preview_queue.cancel(tr)
             src.delete("all")
             tr.delete("all")
             return
@@ -167,7 +176,7 @@ class FloatPreviewMixin:
             if pos is not None and len(pos) != len(rows):
                 pos = None
             try:
-                render_text_to_canvas(
+                self.preview_queue.request(
                     cv, rows, meta, expander=expander, scale=scale,
                     row_positions=pos, accent_font=accent,
                     fallback_font=jp,

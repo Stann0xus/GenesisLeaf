@@ -262,7 +262,10 @@ class NavigatorMixin:
             raw = entry.get("context", "")
             label = _hex_group_label(raw)
             names, _groups = self._context_names("All")
-            return label if label in names else (raw or "(none)")
+            if getattr(self, "_nav_context_source", None) is not names:
+                self._nav_context_source = names
+                self._nav_context_set = frozenset(names)
+            return label if label in self._nav_context_set else (raw or "(none)")
         if field == "Key":
             return entry.get("key", "") or "(none)"
         return str(entry.get("budget", 0))
@@ -290,30 +293,56 @@ class NavigatorMixin:
             self._sync_filter_value_selection()
             return
         self._nav_stats_seen = cache_key
-        candidates = [i for i in range(len(pack.flat)) if self._filters(i, ignore_metadata=True)]
-        active = [i for i in range(len(pack.flat)) if self._filters(i)]
-        groups = {}
-        order = []
-        overall = {
-            "total": len(active),
-            "filled": sum(bool(pack.flat[i][1].get("translation", "")) for i in active),
-            "issues": 0,
-        }
-        for i in candidates:
-            sec, entry = pack.flat[i]
-            name = self._navigator_value(sec, entry)
-            if name not in groups:
-                groups[name] = {"total": 0, "filled": 0, "issues": 0}
-                order.append(name)
-            d = groups[name]
-            d["total"] += 1
-            tr = entry.get("translation", "")
-            d["filled"] += bool(tr)
-            b, spans = parse_text(tr)
-            if (tr and space_verdict(sec, entry, b) == "over") \
-                    or any(x[2] == "nonascii" for x in spans):
-                d["issues"] += 1
-        order.sort(key=(lambda x: pack.section_names.index(x)) if field == "Section" else str.lower)
+        if (field == "Section" and self.filter_status == "All"
+                and self.filter_context == "All" and not self.filter_text):
+            # The common navigator view already has exact section totals in
+            # Pack.stats. Re-parsing every translation here caused a pause
+            # after each edit and each statistics refresh.
+            by_sec = (st or self.get_stats())["by_sec"]
+            groups = {
+                sec: {"total": data["total"], "filled": data["filled"],
+                      "issues": data["over_any"] + data["non_ascii"]}
+                for sec, data in by_sec.items()
+            }
+            for sec in pack.section_names:
+                groups.setdefault(sec, {"total": 0, "filled": 0, "issues": 0})
+            order = list(pack.section_names)
+            chosen = getattr(self, "filter_value", "All")
+            active_groups = (groups.values() if chosen == "All"
+                             else (groups.get(chosen, {"total": 0, "filled": 0}),))
+            overall = {
+                "total": sum(d["total"] for d in active_groups),
+                "filled": (st or self.get_stats())["filled"] if chosen == "All"
+                else groups.get(chosen, {}).get("filled", 0),
+                "issues": 0,
+            }
+        else:
+            candidates = [i for i in range(len(pack.flat))
+                          if self._filters(i, ignore_metadata=True)]
+            active = [i for i in candidates if self._metadata_matches(*pack.flat[i])]
+            groups = {}
+            order = []
+            overall = {
+                "total": len(active),
+                "filled": sum(bool(pack.flat[i][1].get("translation", "")) for i in active),
+                "issues": 0,
+            }
+            for i in candidates:
+                sec, entry = pack.flat[i]
+                name = self._navigator_value(sec, entry)
+                if name not in groups:
+                    groups[name] = {"total": 0, "filled": 0, "issues": 0}
+                    order.append(name)
+                d = groups[name]
+                d["total"] += 1
+                tr = entry.get("translation", "")
+                d["filled"] += bool(tr)
+                b, spans = parse_text(tr)
+                if (tr and space_verdict(sec, entry, b) == "over") \
+                        or any(x[2] == "nonascii" for x in spans):
+                    d["issues"] += 1
+        section_order = {name: n for n, name in enumerate(pack.section_names)}
+        order.sort(key=section_order.__getitem__ if field == "Section" else str.lower)
         self.nav_pack_name.configure(text=os.path.basename(pack.path) if pack.path else "untitled pack")
         self.nav_pack_meta.configure(text="%s  -  %d sections" % (
             pack.header.get("language") or "?", len(pack.section_names)))

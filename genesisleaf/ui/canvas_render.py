@@ -4,17 +4,20 @@ Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 """
 
 import os
+from time import perf_counter
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 import tkinter.font as tkfont
 
 from genesisleaf.compat import _PILImage, _PILImageTk
+from genesisleaf.diagnostics import current as current_diagnostics
 from genesisleaf.core.colors import hex_to_rgb
 from genesisleaf.core.fonttables import PREVIEW_MARGIN, ROW_PITCH
 from genesisleaf.core.legend import ICON_EMOJI
 from genesisleaf.render.icons import (
     _ICON_BAR_HIGH, _ICON_BAR_LOW, _draw_icons_on_image, _load_icon_images,
 )
-from genesisleaf.render.raster import render_font_rows, render_wall_text
+from genesisleaf.render.raster import render_font_rows
 from genesisleaf.core import palette as _palette
 from genesisleaf.ui import theme as _theme
 
@@ -22,7 +25,7 @@ from genesisleaf.ui import theme as _theme
 def render_text_to_canvas(cv, rows, meta=None, expander=None, scale=2,
                           row_positions=None, accent_font=False,
                           emoji_icons=True, fallback_font=None,
-                          rf_config=None):
+                          rf_config=None, _raster=None):
     """Draw `rows` with render_font_rows into `cv` scaled by `scale` and
     centred.
 
@@ -33,12 +36,14 @@ def render_text_to_canvas(cv, rows, meta=None, expander=None, scale=2,
 
     Stores the PhotoImage on `cv._pv_image` so it is not collected. Returns
     `(w, h, widest, limit_px)` on success, else None."""
-    try:
-        w, h, rgba, widest, limit_px, icons, fallbacks = render_font_rows(
-            rows, meta or {}, expander=expander, row_positions=row_positions,
-            accent_font=accent_font)
-    except Exception:
-        return None
+    if _raster is None:
+        try:
+            _raster = render_font_rows(
+                rows, meta or {}, expander=expander, row_positions=row_positions,
+                accent_font=accent_font)
+        except Exception:
+            return None
+    w, h, rgba, widest, limit_px, icons, fallbacks = _raster
     # the canvas around the image follows the theme too, so a theme switch
     # re-skins every preview the next time it is drawn
     try:
@@ -136,8 +141,138 @@ def render_text_to_canvas(cv, rows, meta=None, expander=None, scale=2,
                     fill=_theme.FG_MAIN)
             except tk.TclError:
                 pass
-    cv.configure(scrollregion=(0, 0, w * s + 8, h * s + 8))
+    cv._pv_origin = (ox_im, oy_im)
+    cv._pv_size = (w_disp, h_disp) if _PILImage is not None else (w * s, h * s)
+    _set_preview_scrollregion(cv)
     return w, h, widest, limit_px
+
+
+def _set_preview_scrollregion(cv):
+    ox, oy = cv._pv_origin
+    width, height = cv._pv_size
+    cv.configure(scrollregion=(0, 0,
+                               max(cv.winfo_width(), ox + width + 4),
+                               max(cv.winfo_height(), oy + height + 4)))
+
+
+def reposition_canvas_preview(cv):
+    """Center an existing preview after a resize without rasterizing it again."""
+    if not hasattr(cv, "_pv_size") or not hasattr(cv, "_pv_origin"):
+        return False
+    width, height = cv._pv_size
+    old_x, old_y = cv._pv_origin
+    new_x = max(4, (cv.winfo_width() - width) // 2)
+    new_y = max(4, (cv.winfo_height() - height) // 2)
+    if (new_x, new_y) != (old_x, old_y):
+        cv.move("all", new_x - old_x, new_y - old_y)
+        cv._pv_origin = (new_x, new_y)
+    _set_preview_scrollregion(cv)
+    return True
+
+
+class CanvasRenderQueue:
+    """Rasterize previews on workers; create Tk images only on Tk's thread."""
+
+    def __init__(self, root):
+        self.root = root
+        self.pool = ThreadPoolExecutor(max_workers=2,
+                                       thread_name_prefix="genesisleaf-preview")
+        self.pending = {}
+        self.poll_job = None
+
+    # A one-to-few row preview rasterizes in ~1-2 ms.  Drawing it inline keeps
+    # it in the same Tk repaint as the selection that asked for it; handing it
+    # to a worker and polling made it land a frame or more later.
+    INLINE_ROWS = 6
+
+    def request(self, cv, rows, meta=None, expander=None, scale=2,
+                row_positions=None, accent_font=False, fallback_font=None,
+                rf_config=None, group=None):
+        self.cancel(cv)
+        rows = tuple(rows)
+        meta = dict(meta or {})
+        positions = tuple(row_positions) if row_positions is not None else None
+        if len(rows) <= self.INLINE_ROWS:
+            try:
+                render_text_to_canvas(
+                    cv, rows, meta, expander=expander, scale=scale,
+                    row_positions=positions, accent_font=accent_font,
+                    fallback_font=fallback_font, rf_config=dict(rf_config or {}))
+            except tk.TclError:
+                pass
+            return
+        future = self.pool.submit(render_font_rows, rows, meta,
+                                  expander=expander, row_positions=positions,
+                                  accent_font=accent_font)
+        submitted_at = perf_counter()
+        self.pending[cv] = (future, rows, meta, expander, scale, positions,
+                            accent_font, fallback_font, dict(rf_config or {}),
+                            group, False, submitted_at)
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("RENDER_REQUEST", canvas=str(cv), rows=len(rows), scale=scale)
+        if self.poll_job is None:
+            self.poll_job = self.root.after(16, self._poll)
+
+    def request_blank(self, cv, group=None):
+        """Clear a canvas in the same frame as its render group."""
+        self.cancel(cv)
+        try:
+            cv.delete("all")
+        except tk.TclError:
+            pass
+
+    def cancel(self, cv):
+        previous = self.pending.pop(cv, None)
+        if previous is not None:
+            previous[0].cancel()
+            monitor = current_diagnostics()
+            if monitor is not None:
+                monitor.event("RENDER_CANCEL", canvas=str(cv),
+                              queued_ms=round((perf_counter() - previous[-1]) * 1000, 3))
+
+    def _poll(self):
+        self.poll_job = None
+        for cv, task in list(self.pending.items()):
+            future = task[0]
+            if not future.done():
+                continue
+            group = task[-3]
+            if group is not None and any(
+                    other[-3] is group and not other[0].done()
+                    for other in self.pending.values()):
+                continue
+            self.pending.pop(cv, None)
+            if future.cancelled():
+                continue
+            try:
+                raster = future.result()
+                if cv.winfo_exists():
+                    (_, rows, meta, expander, scale, positions, accent, font,
+                     config, _group, blank, submitted_at) = task
+                    monitor = current_diagnostics()
+                    if monitor is not None:
+                        monitor.event("RENDER_READY", canvas=str(cv),
+                                      queued_ms=round((perf_counter() - submitted_at) * 1000, 3))
+                    if blank:
+                        cv.delete("all")
+                    else:
+                        render_text_to_canvas(
+                            cv, rows, meta, expander=expander, scale=scale,
+                            row_positions=positions, accent_font=accent,
+                            fallback_font=font, rf_config=config, _raster=raster)
+            except Exception:
+                pass
+        if self.pending:
+            self.poll_job = self.root.after(16, self._poll)
+
+    def close(self):
+        if self.poll_job is not None:
+            self.root.after_cancel(self.poll_job)
+            self.poll_job = None
+        for cv in list(self.pending):
+            self.cancel(cv)
+        self.pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _draw_icon_emojis(cv, icons, ox_im, oy_im, scale):
@@ -169,13 +304,3 @@ def _draw_icon_emojis(cv, icons, ox_im, oy_im, scale):
                            fill="#%02x%02x%02x" % tint)
         except tk.TclError:
             pass
-
-
-def _wall_image_rgba(texts):
-    """PIL-frame a wall render into (photo, w*2, h*2)."""
-    w, h, rgba, _ = render_wall_text(list(texts))
-    if _PILImage is None:
-        return None, w, h
-    img = _PILImage.frombytes("RGBA", (w, h), rgba)
-    img = img.resize((w * 2, h * 2), _PILImage.NEAREST)
-    return _PILImageTk.PhotoImage(img), w * 2, h * 2

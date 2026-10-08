@@ -14,7 +14,9 @@ from genesisleaf.core.encoding import parse_text
 from genesisleaf.core.textfix import truncate_to_budget
 from genesisleaf.core.space import KIND_LABEL, room_kind, row_room, verdict as space_verdict
 from genesisleaf.render.metrics import font_advance, measure_markup
-from genesisleaf.ui.canvas_render import render_text_to_canvas
+from genesisleaf.ui.canvas_render import (
+    render_text_to_canvas, reposition_canvas_preview,
+)
 from genesisleaf.ui.fonts import FONT_MONO, FONT_UI_SM
 from genesisleaf.ui import theme as _theme
 
@@ -171,7 +173,8 @@ class WorkbenchWindow:
         cv.pack(fill="both", expand=True)
         self.cv = cv
         self._pv_image = None
-        self.cv.bind("<Configure>", lambda e: self._draw_preview())
+        self.cv.bind("<Configure>", lambda e: (
+            reposition_canvas_preview(self.cv) or self._draw_preview()))
 
         # character inspector text (per-token widths)
         ttk.Label(right, text="Characters (byte, advance)",
@@ -383,10 +386,12 @@ class WorkbenchWindow:
             self.src_txt.configure(state="normal")
             self.src_txt.delete("1.0", "end")
             self.src_txt.insert("1.0", e.get("source", ""))
+            self.src_txt._tag_content = None
             self.app.retag(self.src_txt, idx=i)
             self.src_txt.configure(state="disabled")
             self.tr_txt.delete("1.0", "end")
             self.tr_txt.insert("1.0", e.get("translation", ""))
+            self.tr_txt._tag_content = None
             self.tr_txt.edit_modified(False)
             self.app.retag(self.tr_txt, allow_over=True, idx=i)
             self._update_meters()

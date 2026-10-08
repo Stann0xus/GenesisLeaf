@@ -22,8 +22,13 @@ class LayoutMixin:
         Both splits are draggable.  The table takes most of the extra
         height when the window grows; the navigator keeps its width and can
         be hidden (View > Navigator, Ctrl+B) to give the table the room."""
-        outer = ttk.Panedwindow(self.root, orient="horizontal")
-        outer.pack(side="top", fill="both", expand=True, padx=6, pady=(4, 2))
+        host = ttk.Frame(self.root)
+        host.pack(side="top", fill="both", expand=True, padx=6, pady=(4, 2))
+        self.nav_toggle = ttk.Button(host, text="◀", width=2,
+                                     command=self.toggle_navigator)
+        self.nav_toggle.pack(side="left", anchor="n", padx=(0, 3))
+        outer = ttk.Panedwindow(host, orient="horizontal")
+        outer.pack(side="left", fill="both", expand=True)
         self.body_panes = outer
 
         self.nav_frame = self._build_navigator(outer)
@@ -90,6 +95,7 @@ class LayoutMixin:
         except tk.TclError:
             return "break"
         self.nav_visible = not self.nav_visible
+        self.nav_toggle.configure(text="◀" if self.nav_visible else "▶")
         try:
             self._nav_var.set(self.nav_visible)
         except AttributeError:

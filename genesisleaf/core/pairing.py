@@ -58,6 +58,7 @@ def match(mine, other, cancelled=None):
     match stops early and returns None."""
     used = [False] * len(other)
     by_uuid, by_key, by_src, by_snorm, by_ctx = {}, {}, {}, {}, {}
+    by_section_src = {}
     o_snorm = []
     for oi, (_sec, uu, key, src, ctx) in enumerate(other):
         if uu:
@@ -66,6 +67,7 @@ def match(mine, other, cancelled=None):
             by_key.setdefault(key, []).append(oi)
         if src:
             by_src.setdefault(src, []).append(oi)
+            by_section_src.setdefault((_sec, src), []).append(oi)
         sn = norm(src)
         o_snorm.append(sn)
         if sn:
@@ -75,11 +77,17 @@ def match(mine, other, cancelled=None):
                 by_ctx.setdefault(cn, []).append((len(sn), oi))
     buckets = {cn: _Bucket(items, o_snorm) for cn, items in by_ctx.items()}
 
+    # Every list stays alive for this match. Used entries never become free,
+    # so each evidence list's prefix only needs to be visited once.
+    heads = {}
+
     def first_free(idxs):
-        for oi in idxs:
-            if not used[oi]:
-                return oi
-        return None
+        key = id(idxs)
+        pos = heads.get(key, 0)
+        while pos < len(idxs) and used[idxs[pos]]:
+            pos += 1
+        heads[key] = pos
+        return idxs[pos] if pos < len(idxs) else None
 
     sm = difflib.SequenceMatcher(None)
     pairs = []
@@ -101,7 +109,8 @@ def match(mine, other, cancelled=None):
         if oi is None and src and src in by_src:
             # a byte-identical source is strong evidence on its own; the
             # same section upgrades it to beyond-question
-            got = first_free(o for o in by_src[src] if other[o][0] == sec)
+            same_section = by_section_src.get((sec, src))
+            got = first_free(same_section) if same_section else None
             if got is not None:
                 oi, level, ev = got, "direct", ["source matches",
                                                 "same section"]

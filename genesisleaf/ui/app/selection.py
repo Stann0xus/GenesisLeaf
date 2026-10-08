@@ -3,7 +3,10 @@
 Part of GenesisLeaf 0x01a - see docs/ARCHITECTURE.md.
 """
 
+from contextlib import nullcontext
+
 from genesisleaf.core.encoding import parse_text
+from genesisleaf.diagnostics import current as current_diagnostics
 
 
 class SelectionMixin:
@@ -13,34 +16,73 @@ class SelectionMixin:
     """
 
     # -- selection ------------------------------------------------------------------
-    def _update_sel_count(self):
+    def _see_if_needed(self, iid):
+        """Avoid Treeview.see's layout work for an already visible row."""
+        monitor = current_diagnostics()
+        pos = self._pos_by_iid.get(iid)
+        if pos is not None and self._pos_iids:
+            y_range = getattr(self, "_tree_y_range", None)
+            first, last = y_range if y_range is not None else self.tree.yview()
+            count = len(self._pos_iids)
+            if first * count <= pos and pos + 1 <= last * count:
+                if monitor is not None:
+                    monitor.event("ROW_VISIBILITY", row=pos, visible=True,
+                                  first=round(first, 5), last=round(last, 5))
+                return
+        if monitor is not None:
+            monitor.event("ROW_VISIBILITY", row=pos, visible=False)
+        self.tree.see(iid)
+
+    def _set_tree_selection(self, wanted, current=None):
+        """Apply a selection once and ignore its queued synthetic event."""
+        cur = self.tree.selection() if current is None else current
+        old, new = set(cur), set(wanted)
+        removed = [iid for iid in cur if iid not in new]
+        added = [iid for iid in wanted if iid not in old]
+        if not removed and not added:
+            return
+        monitor = current_diagnostics()
+        if monitor is not None:
+            monitor.event("TREE_SELECTION_DELTA", remove=len(removed),
+                          add=len(added), existing=len(cur))
+        self._tree_auto_selection = frozenset(new)
+        if removed and added:
+            self.tree.selection_set(wanted)
+        elif removed:
+            self.tree.selection_remove(*removed)
+        else:
+            self.tree.selection_add(*added)
+
+    def _update_sel_count(self, selection=None):
         """"n selected" beside the Copy key button."""
         if self.l_selcount is None:
             return
-        n = len(self.tree.selection())
-        self.l_selcount.configure(
-            text="no selection" if not n
-            else ("1 selected" if n == 1 else "%d selected" % n))
+        n = len(self.tree.selection() if selection is None else selection)
+        label = ("no selection" if not n else
+                 "1 selected" if n == 1 else "%d selected" % n)
+        if getattr(self, "_sel_count_label", None) != label:
+            self._sel_count_label = label
+            self.l_selcount.configure(text=label)
 
     def _box_iids(self, i):
         """Tree iids of every view row belonging to `i`'s dialog box."""
         rows = self.box_rows(i)
         if len(rows) <= 1:
             return None
-        found = []
-        for iid, fi in self.view_iid.items():
-            if fi in rows:
-                found.append(iid)
+        # The reverse index is maintained as table chunks are inserted. A
+        # full view scan here made every click cost O(pack size).
+        found = [iid for row in rows
+                 if (iid := self._iid_by_flat.get(row)) is not None]
         return found or None
 
-    def _select_box(self, i):
+    def _select_box(self, i, current_selection=None):
         """Highlight every tree row of `i`'s box (or just its row).
 
         `selection_set` fires <<TreeviewSelect>> even when the selection is
         unchanged, which would re-enter select_entry in a loop; only set it
         when it differs from the current selection.
         """
-        cur = self.tree.selection()
+        cur = self.tree.selection() if current_selection is None else current_selection
         if i is None:
             if cur:
                 self.tree.selection_remove(*cur)
@@ -48,14 +90,14 @@ class SelectionMixin:
             return
         found = self._box_iids(i)
         if found:
-            if tuple(found) != tuple(cur):
-                self.tree.selection_set(found)
-                self.tree.see(found[0])
+            if set(found) != set(cur):
+                self._set_tree_selection(found, current=cur)
+                self._see_if_needed(found[0])
             return
         iid = self._iid_of(i)
         if iid and iid not in cur:
-            self.tree.selection_set(iid)
-            self.tree.see(iid)
+            self._set_tree_selection((iid,), current=cur)
+            self._see_if_needed(iid)
 
     def _iid_of(self, i):
         return self._iid_by_flat.get(i)
@@ -63,17 +105,31 @@ class SelectionMixin:
     def on_tree_select(self, _evt=None):
         # before the lock guard: the count has to follow programmatic
         # selection changes too, and those arrive with _select_lock set
-        self._update_sel_count()
+        sel = self.tree.selection()
+        self._update_sel_count(sel)
         if self._select_lock:
             return
-        sel = self.tree.selection()
+        auto = getattr(self, "_tree_auto_selection", None)
+        if auto is not None:
+            if frozenset(sel) == auto:
+                return
+            self._tree_auto_selection = None
         if not sel:
             return
-        iid = sel[0]
+        if self.cellsel.active():
+            # Tk delivers programmatic selection events after the lock clears.
+            # The cell-pick callback already loaded the active (last) row.
+            return
+        focused = self.tree.focus()
+        iid = focused if focused in sel else sel[0]
         i = self.view_iid.get(iid)
         if i is not None:
             self._reset_edited_walk()
-            self.select_entry(i)
+            if i != self.current:
+                self.select_entry(i)
+            else:
+                self._sync_tr_editors(i)
+                self.update_preview()
             # A shift/ctrl multi-selection (or any selection that is not a
             # plain single row) must be left exactly as the user made it -
             # collapsing it to `sel[0]`'s box would destroy the range.  Only a
@@ -88,10 +144,12 @@ class SelectionMixin:
                     self._select_lock = False
 
     def _on_rowkey(self, evt):
-        sel = self.tree.selection()
+        monitor = current_diagnostics()
+        with (monitor.span("rowkey.read_selection") if monitor else nullcontext()):
+            sel = self.tree.selection()
         if not sel:
             return
-        kids = self.tree.get_children()
+        kids = self._pos_iids
         if not kids:
             return
         # step by the box size: a 3-row dialog box advances the whole block when
@@ -99,10 +157,13 @@ class SelectionMixin:
         step = 1
         i = self.view_iid.get(sel[0])
         if i is not None and self.multi_var.get():
-            rows = self.box_rows(i)
+            with (monitor.span("rowkey.box_lookup") if monitor else nullcontext()):
+                rows = self.box_rows(i)
             if len(rows) > 1:
                 step = len(rows)
-        pos = self.tree.index(sel[0])
+        pos = self._pos_by_iid.get(sel[0])
+        if pos is None:
+            return "break"
         if evt.keysym == "Down":
             target = pos + step
         elif evt.keysym == "Up":
@@ -119,14 +180,17 @@ class SelectionMixin:
         # Scroll the destination into view *before* selecting, otherwise a
         # jump from a search hit or an auto-selection to the next row can move
         # the selection off-screen and leave the table looking frozen.
-        self.tree.see(iid)
-        self.select_entry(i)
+        with (monitor.span("rowkey.scroll") if monitor else nullcontext()):
+            self._see_if_needed(iid)
+        with (monitor.span("rowkey.load_editor") if monitor else nullcontext()):
+            self.select_entry(i)
         self._select_lock = True
         try:
-            if self.multi_var.get():
-                self._select_box(i)
-            else:
-                self.tree.selection_set(iid)
+            with (monitor.span("rowkey.select_tree") if monitor else nullcontext()):
+                if self.multi_var.get():
+                    self._select_box(i, current_selection=sel)
+                else:
+                    self._set_tree_selection((iid,), current=sel)
         finally:
             self._select_lock = False
         return "break"
@@ -139,15 +203,15 @@ class SelectionMixin:
         selection to include the target row without collapsing rows that were
         already selected, mirroring Shift+Click behaviour.
         """
-        kids = self.tree.get_children()
+        kids = self._pos_iids
         if not kids:
             return "break"
         sel = self.tree.selection()
         if not sel:
             # nothing selected yet – start from the first visible row
-            self.tree.see(kids[0])
+            self._see_if_needed(kids[0])
             self.select_entry(self.view_iid.get(kids[0], 0))
-            self.tree.selection_set(kids[0])
+            self._set_tree_selection((kids[0],), current=sel)
             return "break"
         step = 1
         i = self.view_iid.get(sel[0])
@@ -155,7 +219,9 @@ class SelectionMixin:
             rows = self.box_rows(i)
             if len(rows) > 1:
                 step = len(rows)
-        pos = self.tree.index(sel[0])
+        pos = self._pos_by_iid.get(sel[0])
+        if pos is None:
+            return "break"
         if keysym == "Down":
             target = pos + step
         elif keysym == "Up":
@@ -169,7 +235,7 @@ class SelectionMixin:
         ti = self.view_iid.get(iid)
         if ti is None:
             return "break"
-        self.tree.see(iid)
+        self._see_if_needed(iid)
         if multi:
             # extend: add everything between anchor and target to selection
             anchor_pos = pos
@@ -188,7 +254,7 @@ class SelectionMixin:
                 if self.multi_var.get():
                     self._select_box(ti)
                 else:
-                    self.tree.selection_set(iid)
+                    self._set_tree_selection((iid,), current=sel)
             finally:
                 self._select_lock = False
         return "break"
@@ -258,8 +324,11 @@ class SelectionMixin:
                 self._update_words()
             finally:
                 self._loading = False
+            # immediate, not debounced: the preview must repaint together
+            # with the table row and editors (see CanvasRenderQueue.request)
             self.update_preview()
             self.update_status()
+            self._cmp_follow_main(i)
         self._update_clone_label()
 
     def _load_meta(self, i):
@@ -276,6 +345,7 @@ class SelectionMixin:
         self.l_budget.configure(text="- / %d B" % budget)
         self.src_txt.configure(state="normal")
         self.src_txt.delete("1.0", "end")
+        self.src_txt._tag_content = None
         rows = self._ed_rows_for(i)
         if len(rows) > 1:
             src_lines = []

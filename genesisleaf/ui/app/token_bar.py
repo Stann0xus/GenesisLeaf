@@ -122,5 +122,7 @@ class TokenBarMixin:
                 self._tok_more.grid()
         elif self._tok_more.winfo_ismapped():
             self._tok_more.grid_remove()
-        self._rebuild_tok_menu(shown)
+        if getattr(self, "_tok_shown", None) != shown:
+            self._rebuild_tok_menu(shown)
+            self._tok_shown = shown
         self._tok_compact = want_compact

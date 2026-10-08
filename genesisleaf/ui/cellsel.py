@@ -6,6 +6,7 @@ Rules (the same on every table that uses it):
                                                any picked cells are cleared
   * Ctrl+Click on a cell                    -> picks that single cell
   * further Ctrl+Clicks                     -> add / remove cells
+  * Ctrl+Shift+Click                        -> add a column range from the anchor
   * Ctrl+Alt+Click                          -> pick the cell and copy it now
   * Ctrl+C with cells picked                -> copies them as a grid: tab
                                                between cells of one row,
@@ -46,9 +47,16 @@ class CellSelection:
         self.on_pick = on_pick
         self.on_copy = on_copy
         self.cells = []            # [(iid, column), ...] in pick order
+        self._cell_set = set()
+        self._by_row = {}
+        self._order = None
+        self._anchor = None
+        self._last = None
         self._labels = []
+        self._label_states = []
         self._job = None
         tree.bind("<Control-Button-1>", self._ctrl_click)
+        tree.bind("<Control-Shift-Button-1>", self._ctrl_shift_click)
         tree.bind("<Control-Alt-Button-1>", self._ctrl_alt_click)
         for seq in ("<Button-1>", "<Shift-Button-1>", "<Up>", "<Down>",
                     "<Prior>", "<Next>", "<Home>", "<End>"):
@@ -59,11 +67,15 @@ class CellSelection:
             tree.bind(seq, lambda e: self.schedule(), add="+")
         self._wrap_scroll("yscrollcommand")
         self._wrap_scroll("xscrollcommand")
+        tree.bind("<Destroy>", self._destroy, add="+")
 
     # -- plumbing -----------------------------------------------------------
     def _wrap_scroll(self, opt):
         """Chain onto the tree's scroll callback so highlights follow the
         rows when the table scrolls by any means (wheel, bar, keys, see())."""
+        if opt == "yscrollcommand" and hasattr(self.tree, "add_scroll_observer"):
+            self.tree.add_scroll_observer(self.schedule)
+            return
         try:
             prev = self.tree.cget(opt)
         except tk.TclError:
@@ -104,12 +116,43 @@ class CellSelection:
         if not col or not iid:
             return False
         cell = (iid, col)
-        if cell in self.cells and toggle:
+        if cell in self._cell_set and toggle:
             self.cells.remove(cell)
-        elif cell not in self.cells:
-            self.cells.append(cell)
+            self._cell_set.remove(cell)
+            self._by_row[iid].remove(col)
+            if not self._by_row[iid]:
+                del self._by_row[iid]
+        else:
+            self._add(cell)
+        self._anchor = cell
+        self._last = iid
         self._after_change()
         return True
+
+    def _add(self, cell):
+        if cell not in self._cell_set:
+            self.cells.append(cell)
+            self._cell_set.add(cell)
+            self._by_row.setdefault(cell[0], set()).add(cell[1])
+
+    def _ctrl_shift_click(self, evt):
+        col = self.column_at(evt.x, evt.y)
+        iid = self.tree.identify_row(evt.y)
+        if col and iid:
+            anchor = self._anchor
+            rows = self.tree.get_children("")
+            order = {row: n for n, row in enumerate(rows)}
+            if anchor is None or anchor[0] not in order or iid not in order:
+                self._pick_at(evt, toggle=False)
+            else:
+                lo, hi = sorted((order[anchor[0]], order[iid]))
+                for row in rows[lo:hi + 1]:
+                    self._add((row, col))
+                self._order = order
+                self._last = iid
+                self._after_change()
+        self.tree.focus_set()
+        return "break"
 
     def _ctrl_click(self, evt):
         self._pick_at(evt)
@@ -134,7 +177,7 @@ class CellSelection:
         rows = self.rows()
         if self.on_pick is not None and rows:
             self.on_pick(rows)
-        self.redraw()
+        self.schedule()
 
     # -- queries ------------------------------------------------------------
     def active(self):
@@ -142,6 +185,8 @@ class CellSelection:
 
     def last_row(self):
         """Row of the most recently picked cell (the 'active' cell)."""
+        if self._last in self._by_row and self.tree.exists(self._last):
+            return self._last
         for iid, _c in reversed(self.cells):
             if self.tree.exists(iid):
                 return iid
@@ -150,11 +195,10 @@ class CellSelection:
     def rows(self):
         """Row iids of the picked cells, in table order, de-duplicated."""
         tv = self.tree
-        seen = []
-        for iid, _c in self.cells:
-            if iid not in seen and tv.exists(iid):
-                seen.append(iid)
-        return sorted(seen, key=tv.index)
+        if self._order is None or any(i not in self._order for i in self._by_row):
+            self._order = {iid: n for n, iid in enumerate(tv.get_children(""))}
+        return sorted((i for i in self._by_row if i in self._order),
+                      key=self._order.__getitem__)
 
     def text(self):
         """The picked cells as a tab/newline grid."""
@@ -188,25 +232,63 @@ class CellSelection:
 
     def clear(self):
         self.cells = []
-        self.redraw()
+        self._cell_set.clear()
+        self._by_row.clear()
+        self._order = None
+        self._anchor = self._last = None
+        self._cancel_draw()
+        for lab in self._labels:
+            lab.place_forget()
+        self._label_states = [None] * len(self._labels)
+
+    def _cancel_draw(self):
+        if self._job is not None:
+            self.tree.after_cancel(self._job)
+            self._job = None
+
+    def _destroy(self, evt):
+        if evt.widget is self.tree:
+            self._cancel_draw()
 
     def forget_missing(self):
         """Drop cells whose rows left the table (rebuild / filter)."""
         tv = self.tree
         self.cells = [(i, c) for i, c in self.cells if tv.exists(i)]
+        self._cell_set = set(self.cells)
+        self._by_row = {}
+        for i, c in self.cells:
+            self._by_row.setdefault(i, set()).add(c)
+        self._order = None
         self.schedule()
 
     # -- drawing ------------------------------------------------------------
     def schedule(self):
-        """Redraw on the next idle (coalesces bursts of scroll events)."""
+        """Coalesce scroll/selection bursts into one pending frame."""
         if self._job is None and (self.cells or self._labels):
-            self._job = self.tree.after_idle(self.redraw)
+            self._job = self.tree.after(16, self.redraw)
 
     def redraw(self):
-        self._job = None
+        self._cancel_draw()
         tv = self.tree
         live = []
-        for iid, col in self.cells:
+        # Highlights outside the viewport cannot be drawn. Walk visible rows
+        # for every selection size so repaint work stays bounded as cells are
+        # added, including during a long sequence of Ctrl+clicks.
+        visible = []
+        seen = set()
+        y = 0
+        while y < tv.winfo_height():
+            iid = tv.identify_row(y)
+            box = tv.bbox(iid) if iid else None
+            if box:
+                if iid not in seen:
+                    visible.append(iid)
+                    seen.add(iid)
+                y = max(y + 1, box[1] + box[3])
+            else:
+                y += 1
+        cells = ((i, c) for i in visible for c in self._by_row.get(i, ()))
+        for iid, col in cells:
             if not tv.exists(iid):
                 continue
             try:
@@ -220,11 +302,21 @@ class CellSelection:
                            borderwidth=0, highlightthickness=2)
             # clicks on a highlight act like clicks on the cell under it
             lab.bind("<Control-Button-1>", self._relay_ctrl)
+            lab.bind("<Control-Shift-Button-1>", self._relay_range)
+            lab.bind("<Control-Alt-Button-1>", self._relay_copy)
             lab.bind("<Button-1>", self._relay_plain)
             self._labels.append(lab)
-        for lab in self._labels[len(live):]:
-            lab.place_forget()
-        for lab, ((x, y, w, h), val) in zip(self._labels, live):
+            self._label_states.append(None)
+        for n in range(len(live), len(self._labels)):
+            if self._label_states[n] is not None:
+                self._labels[n].place_forget()
+                self._label_states[n] = None
+        for n, (lab, ((x, y, w, h), val)) in enumerate(zip(self._labels, live)):
+            state = (x, y, w, h, str(val), _theme.TH_SEL_BG,
+                     _theme.TH_SEL_FG, _theme.TH_ACCENT)
+            if state == self._label_states[n]:
+                continue
+            self._label_states[n] = state
             lab.configure(text=str(val).replace("\n", " "),
                           bg=_theme.TH_SEL_BG, fg=_theme.TH_SEL_FG,
                           highlightbackground=_theme.TH_ACCENT,
@@ -242,6 +334,14 @@ class CellSelection:
         x, y = self._relay(evt)
         fake = type("E", (), {"x": x, "y": y, "state": CTRL})()
         return self._ctrl_click(fake)
+
+    def _relay_range(self, evt):
+        x, y = self._relay(evt)
+        return self._ctrl_shift_click(type("E", (), {"x": x, "y": y})())
+
+    def _relay_copy(self, evt):
+        x, y = self._relay(evt)
+        return self._ctrl_alt_click(type("E", (), {"x": x, "y": y})())
 
     def _relay_plain(self, evt):
         x, y = self._relay(evt)

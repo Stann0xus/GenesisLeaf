@@ -19,6 +19,7 @@ Part of GenesisLeaf - see docs/ARCHITECTURE.md.
 """
 
 import base64
+from math import ceil
 
 _SKIN = None            # (quads, block_w, [(r, g, b, a)]) or False
 
@@ -79,15 +80,17 @@ def paint_window(rgba, w, h, sch, limit_x=0):
         else:
             t = (y - y0) / float(span)
             row_c = tuple(int(top[k] + (bot[k] - top[k]) * t) for k in range(3))
-        line = bytearray()
-        for x in range(w):
-            if y < y0 or y >= y1 or x < inset or x >= w - inset:
-                c = scene
-            elif limit_x and x >= limit_x:
-                c = past
-            else:
-                c = row_c
-            line += bytes((c[0], c[1], c[2], 255))
+        # Bulk byte copies keep O(w*h) output work in C instead of creating a
+        # four-byte object and branching for every background pixel in Python.
+        line = bytearray(bytes((scene[0], scene[1], scene[2], 255)) * w) if w > 0 else bytearray()
+        left, right = min(inset, w), max(min(inset, w), w - inset)
+        if y0 <= y < y1 and right > left:
+            # Comparisons with fractional limits used to switch at ceil(x).
+            cut = ceil(max(left, min(right, limit_x))) if limit_x else right
+            if cut > left:
+                line[left * 4:cut * 4] = bytes((row_c[0], row_c[1], row_c[2], 255)) * (cut - left)
+            if right > cut:
+                line[cut * 4:right * 4] = bytes((past[0], past[1], past[2], 255)) * (right - cut)
         rgba[o:o + w * 4] = line
     if sk:
         _paint_frame(rgba, w, h, sk, _recolour(sch))

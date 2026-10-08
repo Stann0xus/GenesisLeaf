@@ -49,11 +49,18 @@ class ReferencesMixin:
 
     def box_rows(self, idx):
         """Flat indices of `idx`'s dialogue box, in box order, or [idx]."""
-        row = self.box_map().get(idx)
+        mapping = self.box_map()
+        if getattr(self, "_box_rows_source", None) is not mapping:
+            grouped = {}
+            for i, (box, _row) in mapping.items():
+                grouped.setdefault(box, []).append(i)
+            self._box_rows_index = grouped
+            self._box_rows_source = mapping
+        row = mapping.get(idx)
         if row is None:
             return [idx]
         box_no = row[0]
-        return [i for i, (b, _r) in self.box_map().items() if b == box_no]
+        return list(self._box_rows_index[box_no])
 
     def markup_expander(self):
         """Resolve {c1..} substitution tokens to the referenced entry's
